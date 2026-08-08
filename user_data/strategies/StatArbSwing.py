@@ -706,7 +706,34 @@ class StatArbSwing(IStrategy):
         cointegration) already ran in ``populate_entry_trend``; this hook
         adds the checks that require live portfolio state and therefore
         can't run during vectorized backtesting.
+
+        Every code path below is wrapped so this method can never raise:
+        Freqtrade calls ``confirm_trade_entry`` through
+        ``strategy_safe_wrapper(..., default_retval=True)``
+        (``freqtradebot.py``), meaning an *unhandled* exception here
+        would make Freqtrade log a warning and then treat the entry as
+        **confirmed** — the exact opposite of what a risk gate should do
+        on failure. Any unexpected error is therefore caught explicitly
+        and turned into a blocked entry (``False``) with a logged
+        reason, so this gate fails closed, not open.
         """
+        try:
+            return self._confirm_trade_entry_unsafe(
+                pair=pair, rate=rate, current_time=current_time, side=side
+            )
+        except Exception:
+            logger.exception(
+                "confirm_trade_entry raised an unexpected error for %s; blocking entry "
+                "(fail closed)",
+                pair,
+            )
+            return False
+
+    def _confirm_trade_entry_unsafe(
+        self, *, pair: str, rate: float, current_time: datetime, side: str
+    ) -> bool:
+        """The real confirm_trade_entry logic; see the public method's docstring for why
+        every call site of this goes through a blanket try/except that fails closed."""
         role = determine_pair_role(pair, self.Y_PAIR, self.X_PAIR)
         if role is None:
             return False
@@ -721,7 +748,11 @@ class StatArbSwing(IStrategy):
             logger.info("Spread not yet available for %s; blocking entry", pair)
             return False
 
-        equity = self.wallets.get_total_stake_amount() if self.wallets else 0.0
+        if self.wallets is None:
+            logger.warning("No wallets available for %s; blocking entry", pair)
+            return False
+        equity = self.wallets.get_total_stake_amount()
+
         open_trades = Trade.get_open_trades()
         current_positions = positions_notional_from_trades(open_trades, exclude_pair=pair)
         position_side = PositionSide.LONG if side == "long" else PositionSide.SHORT
@@ -751,7 +782,24 @@ class StatArbSwing(IStrategy):
         current_time: datetime,
         **kwargs: Any,
     ) -> bool:
-        """Record the exit with the risk engine, arming the cooldown on a stop loss."""
+        """Record the exit with the risk engine, arming the cooldown on a stop loss.
+
+        Never blocks the exit itself: a failure to record cooldown
+        bookkeeping is a (logged) internal error, not a reason to leave
+        an open position stuck unable to close. Freqtrade also defaults
+        an unhandled exception here to "confirmed" anyway
+        (``strategy_safe_wrapper(..., default_retval=True)`` in
+        ``freqtradebot.py``), but catching it explicitly avoids an
+        alarming "Unexpected error" log for what is, from a trading
+        perspective, a non-fatal bookkeeping failure.
+        """
         stop_loss_triggered = exit_reason in ("stop_loss", "stoploss")
-        self.risk_engine.record_exit(pair, current_time, stop_loss_triggered=stop_loss_triggered)
+        try:
+            self.risk_engine.record_exit(pair, current_time, stop_loss_triggered=stop_loss_triggered)
+        except Exception:
+            logger.exception(
+                "Failed to record exit with the risk engine for %s; cooldown may not be "
+                "armed, but the exit itself is not blocked",
+                pair,
+            )
         return True

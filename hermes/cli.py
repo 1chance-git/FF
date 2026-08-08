@@ -71,8 +71,21 @@ def cli(ctx: click.Context, json_log_file: Path | None, verbose: bool) -> None:
 
 @cli.command()
 @click.option("--api-url", default="http://127.0.0.1:8080", show_default=True)
-@click.option("--username", default=None, help="Freqtrade REST API username.")
-@click.option("--password", default=None, help="Freqtrade REST API password.")
+@click.option(
+    "--username",
+    default=None,
+    envvar="HERMES_API_USERNAME",
+    help="Freqtrade REST API username. Can also be set via HERMES_API_USERNAME.",
+)
+@click.option(
+    "--password",
+    default=None,
+    envvar="HERMES_API_PASSWORD",
+    help=(
+        "Freqtrade REST API password. Prefer HERMES_API_PASSWORD over this flag: "
+        "a CLI argument is visible in shell history and `ps` output on shared systems."
+    ),
+)
 def health(api_url: str, username: str | None, password: str | None) -> None:
     """Run health checks against a running bot's REST API and print a report."""
     from freqtrade_client import FtRestClient

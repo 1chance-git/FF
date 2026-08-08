@@ -1,5 +1,12 @@
 # FF — Statistical Arbitrage Trading System
 
+> **Production audit:** see [`AUDIT.md`](AUDIT.md) for a full review of
+> code quality, architecture, performance, numerical correctness, memory
+> usage, error handling, logging, statistical assumptions, and risk
+> controls across the whole system, including one critical fix (a risk
+> gate that failed *open* rather than closed on error) and two
+> significant live-trading performance fixes.
+
 ## Foundation module
 
 This is the project foundation: a clean, launchable [Freqtrade](https://www.freqtrade.io/)

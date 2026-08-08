@@ -238,6 +238,40 @@ def test_regime_config_validation() -> None:
         RegimeConfig(window=5)
     with pytest.raises(RiskError, match="significance_level"):
         RegimeConfig(significance_level=2.0)
+    with pytest.raises(RiskError, match="adf_maxlag"):
+        RegimeConfig(adf_maxlag=-1)
+
+
+def test_regime_config_default_adf_maxlag_is_bounded() -> None:
+    """A small default keeps detect_regime fast on realistic history lengths.
+
+    Uncapped ``autolag`` search (statsmodels' default) is the dominant
+    cost of detect_regime and scales with window size; regressing to an
+    unbounded default here would silently reintroduce that slowdown.
+    """
+    assert RegimeConfig().adf_maxlag <= 4
+
+
+def test_detect_regime_capped_maxlag_matches_uncapped_classification() -> None:
+    """Capping adf_maxlag must not change the regime classification it produces.
+
+    Cross-checks the bounded-search p-value against an explicit
+    unbounded (autolag with no maxlag cap) call for the same window, on
+    both a mean-reverting and a trending series, confirming the speed
+    optimization doesn't change real-world classification outcomes.
+    """
+    from statsmodels.tsa.stattools import adfuller
+
+    mean_reverting = make_mean_reverting_series(n=100)
+    trending = make_trending_series(n=100)
+
+    for series in (mean_reverting, trending):
+        window_values = series.iloc[-40:].to_numpy()
+        capped_p = adfuller(window_values, maxlag=2, autolag="AIC")[1]
+        uncapped_p = adfuller(window_values, autolag="AIC")[1]
+        capped_classification = capped_p < 0.05
+        uncapped_classification = uncapped_p < 0.05
+        assert capped_classification == uncapped_classification
 
 
 # ---------------------------------------------------------------------------
@@ -538,3 +572,75 @@ def test_engine_cooldown_expires() -> None:
     )
 
     assert not any("cooldown" in r for r in decision.reasons)
+
+
+def test_engine_evaluate_entry_decision_unaffected_by_history_length() -> None:
+    """A long price history must not change the decision vs. only the recent tail.
+
+    evaluate_entry only ever reads the latest regime/trend value, so it
+    internally trims `prices` to each check's rolling window before
+    running detect_regime/compute_trend_filter (see the comment at that
+    call site) rather than recomputing over the entire series. This
+    locks in that the resulting decision is identical either way -- a
+    long history must not silently change (or slow down) the outcome.
+    """
+    long_series = make_mean_reverting_series(n=2000, seed=5)
+    short_series = long_series.tail(200).reset_index(drop=True)
+    # Re-align both to a fresh, equally-spaced index so only length differs.
+    long_series = long_series.reset_index(drop=True)
+
+    config = RiskEngineConfig(regime=RegimeConfig(window=40), trend_filter=TrendFilterConfig(window=20))
+
+    decision_long = RiskEngine(config).evaluate_entry(
+        pair="BTC/USDC:USDC",
+        side=PositionSide.LONG,
+        entry_price=float(long_series.iloc[-1]),
+        equity=10_000.0,
+        prices=long_series,
+        current_positions={},
+        current_time=UTC_NOW,
+    )
+    decision_short = RiskEngine(config).evaluate_entry(
+        pair="BTC/USDC:USDC",
+        side=PositionSide.LONG,
+        entry_price=float(short_series.iloc[-1]),
+        equity=10_000.0,
+        prices=short_series,
+        current_positions={},
+        current_time=UTC_NOW,
+    )
+
+    assert decision_long.regime == decision_short.regime
+    assert decision_long.is_trending == decision_short.is_trending
+    assert decision_long.allowed == decision_short.allowed
+
+
+def test_engine_evaluate_entry_stays_fast_on_a_long_history() -> None:
+    """Performance regression guard: evaluate_entry must not scale with history length.
+
+    Before this was fixed, evaluate_entry ran detect_regime/
+    compute_trend_filter over the *entire* prices series even though it
+    only reads the latest value, making every single entry check (called
+    once per prospective live trade) cost seconds on a realistic history
+    length. Pins a tight wall-clock budget so that regressing back to
+    "recompute over everything" is caught here.
+    """
+    import time
+
+    series = make_mean_reverting_series(n=3000, seed=6)
+    config = RiskEngineConfig(regime=RegimeConfig(window=40), trend_filter=TrendFilterConfig(window=20))
+    engine = RiskEngine(config)
+
+    start = time.perf_counter()
+    engine.evaluate_entry(
+        pair="BTC/USDC:USDC",
+        side=PositionSide.LONG,
+        entry_price=float(series.iloc[-1]),
+        equity=10_000.0,
+        prices=series,
+        current_positions={},
+        current_time=UTC_NOW,
+    )
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 0.5, f"evaluate_entry took {elapsed:.3f}s on a 3,000-row history"

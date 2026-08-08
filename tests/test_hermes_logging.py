@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import logging.handlers
 
 import pytest
 
@@ -86,3 +87,61 @@ def test_configure_logging_no_channels_uses_null_handler(tmp_path) -> None:
 def test_get_logger_returns_named_logger() -> None:
     logger = get_logger("hermes.foo")
     assert logger.name == "hermes.foo"
+
+
+def test_config_rejects_non_positive_max_bytes() -> None:
+    with pytest.raises(ValueError, match="json_log_max_bytes must be positive"):
+        LoggingConfig(json_log_max_bytes=0)
+
+
+def test_config_rejects_negative_backup_count() -> None:
+    with pytest.raises(ValueError, match="json_log_backup_count must be non-negative"):
+        LoggingConfig(json_log_backup_count=-1)
+
+
+def test_json_log_file_handler_rotates_instead_of_growing_unbounded(tmp_path) -> None:
+    """The JSON log file must use a RotatingFileHandler, not a plain FileHandler.
+
+    A long-lived operational tool writing an unbounded log file is a
+    real disk-usage risk; this pins the handler type so a future change
+    can't silently regress back to unbounded growth.
+    """
+    log_file = tmp_path / "hermes.log"
+    configure_logging(
+        LoggingConfig(
+            json_log_file=log_file,
+            console=False,
+            json_log_max_bytes=1024,
+            json_log_backup_count=3,
+        )
+    )
+
+    handlers = [
+        h
+        for h in logging.getLogger().handlers
+        if isinstance(h, logging.handlers.RotatingFileHandler)
+    ]
+    assert len(handlers) == 1
+    assert handlers[0].maxBytes == 1024
+    assert handlers[0].backupCount == 3
+
+
+def test_json_log_file_actually_rotates_when_size_limit_exceeded(tmp_path) -> None:
+    log_file = tmp_path / "hermes.log"
+    configure_logging(
+        LoggingConfig(
+            json_log_file=log_file,
+            console=False,
+            json_log_max_bytes=200,
+            json_log_backup_count=2,
+        )
+    )
+
+    logger = get_logger("hermes.test.rotation")
+    for i in range(50):
+        logger.info("a fairly long log message to fill up the rotation limit quickly %d", i)
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+    rotated_file = tmp_path / "hermes.log.1"
+    assert rotated_file.exists()

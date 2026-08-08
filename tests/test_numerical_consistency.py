@@ -139,9 +139,11 @@ def test_adf_pvalue_matches_direct_statsmodels_call() -> None:
     """detect_regime's per-window ADF p-value must match calling statsmodels directly.
 
     Confirms the rolling wrapper (`.rolling().apply(_adf_pvalue)`)
-    passes exactly the right slice to `adfuller` with the right
-    arguments, rather than e.g. an off-by-one window or a different
-    `autolag` setting silently baked in.
+    passes exactly the right slice, and the same `maxlag`/`autolag`
+    arguments (see `RegimeConfig.adf_maxlag`'s docstring for why the
+    search is deliberately bounded rather than statsmodels' default
+    unbounded search), to `adfuller` — rather than e.g. an off-by-one
+    window or a silently different setting.
     """
     from statsmodels.tsa.stattools import adfuller
 
@@ -157,7 +159,7 @@ def test_adf_pvalue_matches_direct_statsmodels_call() -> None:
     with_regime = detect_regime(spread, regime_config)
 
     window_values = spread.iloc[-window:].to_numpy()
-    expected_pvalue = adfuller(window_values, autolag="AIC")[1]
+    expected_pvalue = adfuller(window_values, maxlag=regime_config.adf_maxlag, autolag="AIC")[1]
     is_mean_reverting = expected_pvalue < regime_config.significance_level
 
     assert with_regime.iloc[-1] == ("mean_reverting" if is_mean_reverting else "trending")
@@ -303,3 +305,36 @@ def test_no_nan_or_inf_leaks_past_the_warmup_period() -> None:
     )
     post_warmup_zscore = spread_result.zscore.dropna()
     assert np.isfinite(post_warmup_zscore.to_numpy()).all()
+
+
+def test_detect_regime_stays_fast_on_a_realistic_live_history_length() -> None:
+    """Performance regression guard: detect_regime must stay well under Freqtrade's loop budget.
+
+    `detect_regime` recomputes over the *entire* available history on
+    every `populate_indicators` refresh (Freqtrade's normal, non-
+    incremental execution model), and re-runs an ADF regression per
+    row. Left with statsmodels' default *unbounded* `autolag` lag
+    search, this took ~3.5s for a 1,000-row / 30-bar-window series in
+    profiling — comparable to or exceeding `user_data/config.json`'s
+    5-second `process_throttle_secs`, i.e. a real risk of the bot
+    falling behind its own loop in live trading. `RegimeConfig`'s
+    `adf_maxlag` default bounds that search; this test pins a wall-clock
+    budget so a future change that quietly removes or widens that bound
+    fails loudly here instead of only showing up as a live-trading
+    slowdown.
+    """
+    import time
+
+    n = 1000
+    rng = np.random.default_rng(11)
+    spread = pd.Series(np.cumsum(rng.normal(0, 1, n)))
+
+    start = time.perf_counter()
+    detect_regime(spread, RegimeConfig(window=30))
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 2.5, (
+        f"detect_regime took {elapsed:.2f}s for {n} rows; expected well under "
+        f"process_throttle_secs (5s) with headroom for the trend filter, regression, "
+        f"and a second pair also running each loop iteration"
+    )

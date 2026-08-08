@@ -79,6 +79,46 @@ def test_health_command_reports_healthy(monkeypatch) -> None:
     assert "healthy" in result.output.lower()
 
 
+def test_health_command_reads_credentials_from_environment(monkeypatch) -> None:
+    """--username/--password must be settable via HERMES_API_USERNAME/PASSWORD.
+
+    Avoids operators having to pass secrets as bare CLI arguments, which
+    are visible in shell history and `ps` output on shared systems.
+    """
+    captured = {}
+
+    def fake_ft_rest_client(api_url, username, password):
+        captured["username"] = username
+        captured["password"] = password
+
+        class Client:
+            def ping(self):
+                return {"status": "pong"}
+
+            def health(self):
+                return {}
+
+            def version(self):
+                return {"version": "2026.7"}
+
+            def sysinfo(self):
+                return {"cpu_pct": [1.0], "ram_pct": 1.0}
+
+        return Client()
+
+    import freqtrade_client
+
+    monkeypatch.setattr(freqtrade_client, "FtRestClient", fake_ft_rest_client)
+    monkeypatch.setenv("HERMES_API_USERNAME", "env-user")
+    monkeypatch.setenv("HERMES_API_PASSWORD", "env-pass")
+
+    result = CliRunner().invoke(cli, ["health"])
+
+    assert result.exit_code == 0
+    assert captured["username"] == "env-user"
+    assert captured["password"] == "env-pass"
+
+
 def test_health_command_reports_unhealthy_with_nonzero_exit(monkeypatch) -> None:
     def fake_ft_rest_client(*args, **kwargs):
         class Client:

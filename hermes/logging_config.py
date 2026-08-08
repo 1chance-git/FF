@@ -38,11 +38,19 @@ Design decisions
   once from `hermes.cli` and again from a test) removes any handlers it
   previously installed before adding new ones, rather than stacking
   duplicate handlers that would double-log everything.
+* **The JSON log file rotates.** A plain, non-rotating file handler
+  would grow without bound for a long-lived operational tool — the same
+  reason the trading bot's own `log_config` (see
+  `user_data/config.json`) uses a `RotatingFileHandler` rather than a
+  bare one. Hermes matches that convention (`RotatingFileHandler`,
+  configurable max size/backup count) instead of introducing a second,
+  inconsistent logging behavior for the same kind of file.
 """
 
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,12 +84,19 @@ class LoggingConfig:
         Whether the console handler shows the source file/line for each
         log record. Useful for development, noisy for routine
         operational use.
+    json_log_max_bytes:
+        Rotate the JSON log file once it reaches this size. Matches the
+        trading bot's own `log_config` default (10 MB).
+    json_log_backup_count:
+        Number of rotated JSON log files to retain.
     """
 
     level: str = "INFO"
     json_log_file: Path | None = None
     console: bool = True
     console_show_path: bool = False
+    json_log_max_bytes: int = 10 * 1024 * 1024
+    json_log_backup_count: int = 10
 
     def __post_init__(self) -> None:
         valid_levels = logging.getLevelNamesMapping() if hasattr(
@@ -89,6 +104,10 @@ class LoggingConfig:
         ) else {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
         if self.level.upper() not in valid_levels:
             raise ValueError(f"Invalid logging level: {self.level!r}")
+        if self.json_log_max_bytes <= 0:
+            raise ValueError("json_log_max_bytes must be positive")
+        if self.json_log_backup_count < 0:
+            raise ValueError("json_log_backup_count must be non-negative")
 
 
 def configure_logging(config: LoggingConfig | None = None) -> logging.Logger:
@@ -119,8 +138,17 @@ def configure_logging(config: LoggingConfig | None = None) -> logging.Logger:
 
     if config.json_log_file is not None:
         config.json_log_file.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(config.json_log_file, encoding="utf-8")
-        file_handler.setFormatter(JsonFormatter(_JSON_LOG_FORMAT, rename_fields={"asctime": "timestamp", "levelname": "level"}))
+        file_handler = logging.handlers.RotatingFileHandler(
+            config.json_log_file,
+            maxBytes=config.json_log_max_bytes,
+            backupCount=config.json_log_backup_count,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(
+            JsonFormatter(
+                _JSON_LOG_FORMAT, rename_fields={"asctime": "timestamp", "levelname": "level"}
+            )
+        )
         setattr(file_handler, _HERMES_HANDLER_MARKER, True)
         root_logger.addHandler(file_handler)
 

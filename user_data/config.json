@@ -67,14 +67,15 @@
         "chat_id": ""
     },
 
+    "//api_server_security": "enabled is false by default. jwt_secret_key/ws_token/username/password below are placeholders, deliberately committed to git history and therefore NOT secret -- before ever setting enabled=true, override every one of these via user_data/config-private.json (see config-private.json.example), which is gitignored. Never flip enabled=true on the committed values as-is.",
     "api_server": {
         "enabled": false,
         "listen_ip_address": "127.0.0.1",
         "listen_port": 8080,
         "verbosity": "error",
         "enable_openapi": false,
-        "jwt_secret_key": "5687c4440e9ca93036a530b10a592376b7a90c33e0f53435a18facbaa0a9eeff",
-        "ws_token": "916a19502190ea7f96e51cf2559ea29483ce675e2befa50493fa4032403d350f",
+        "jwt_secret_key": "INSECURE_PLACEHOLDER_COMMITTED_TO_GIT_REPLACE_VIA_CONFIG_PRIVATE_JSON",
+        "ws_token": "INSECURE_PLACEHOLDER_COMMITTED_TO_GIT_REPLACE_VIA_CONFIG_PRIVATE_JSON",
         "CORS_origins": [],
         "username": "changeme",
         "password": "changeme"

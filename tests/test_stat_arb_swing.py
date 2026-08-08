@@ -494,6 +494,115 @@ def test_strategy_confirm_trade_entry_blocks_without_analyzed_data(sas) -> None:
     assert allowed is False
 
 
+def test_strategy_confirm_trade_entry_blocks_when_wallets_unavailable(sas) -> None:
+    strategy = make_strategy(sas)
+    y_df, x_df = make_cointegrated_legs(n=250)
+    strategy.dp = SimpleNamespace(
+        get_analyzed_dataframe=lambda pair, timeframe: (
+            strategy.populate_indicators(y_df.copy(), {"pair": Y_PAIR}),
+            None,
+        )
+    )
+    strategy.wallets = None
+
+    allowed = strategy.confirm_trade_entry(
+        pair=Y_PAIR,
+        order_type="limit",
+        amount=1.0,
+        rate=100.0,
+        time_in_force="GTC",
+        current_time=datetime.now(timezone.utc),
+        entry_tag=None,
+        side="long",
+    )
+    assert allowed is False
+
+
+def test_strategy_confirm_trade_entry_fails_closed_on_unexpected_exception(sas) -> None:
+    """The core "no risk gate fails open" guarantee: an internal exception must block, not allow.
+
+    Freqtrade wraps confirm_trade_entry with
+    strategy_safe_wrapper(..., default_retval=True) -- meaning an
+    *unhandled* exception here would make Freqtrade treat the entry as
+    confirmed. StatArbSwing must never rely on that fallback: any
+    unexpected error inside confirm_trade_entry must itself be caught
+    and turned into a blocked (False) entry.
+    """
+    strategy = make_strategy(sas)
+
+    class ExplodingDataProvider:
+        def get_analyzed_dataframe(self, pair, timeframe):
+            raise RuntimeError("simulated dataprovider failure")
+
+    strategy.dp = ExplodingDataProvider()
+
+    allowed = strategy.confirm_trade_entry(
+        pair=Y_PAIR,
+        order_type="limit",
+        amount=1.0,
+        rate=100.0,
+        time_in_force="GTC",
+        current_time=datetime.now(timezone.utc),
+        entry_tag=None,
+        side="long",
+    )
+
+    assert allowed is False
+
+
+def test_strategy_confirm_trade_entry_fails_closed_when_risk_engine_raises(sas) -> None:
+    """Same fail-closed guarantee, triggered from inside the risk engine call itself."""
+    strategy = make_strategy(sas)
+    y_df, x_df = make_cointegrated_legs(n=250)
+    strategy.dp = SimpleNamespace(get_pair_dataframe=lambda pair, timeframe: x_df)
+    indicators_df = strategy.populate_indicators(y_df.copy(), {"pair": Y_PAIR})
+    strategy.dp = SimpleNamespace(
+        get_analyzed_dataframe=lambda pair, timeframe: (indicators_df, None)
+    )
+    strategy.wallets = SimpleNamespace(get_total_stake_amount=lambda: 10_000.0)
+
+    def exploding_evaluate_entry(*args, **kwargs):
+        raise RuntimeError("simulated risk engine failure")
+
+    strategy.risk_engine.evaluate_entry = exploding_evaluate_entry
+
+    allowed = strategy.confirm_trade_entry(
+        pair=Y_PAIR,
+        order_type="limit",
+        amount=1.0,
+        rate=100.0,
+        time_in_force="GTC",
+        current_time=datetime.now(timezone.utc),
+        entry_tag=None,
+        side="long",
+    )
+
+    assert allowed is False
+
+
+def test_strategy_confirm_trade_exit_still_confirms_when_record_exit_raises(sas) -> None:
+    """Exits must never be blocked by a cooldown-bookkeeping failure."""
+    strategy = make_strategy(sas)
+
+    def exploding_record_exit(*args, **kwargs):
+        raise RuntimeError("simulated risk engine failure")
+
+    strategy.risk_engine.record_exit = exploding_record_exit
+
+    result = strategy.confirm_trade_exit(
+        pair=Y_PAIR,
+        trade=SimpleNamespace(),
+        order_type="limit",
+        amount=1.0,
+        rate=95.0,
+        time_in_force="GTC",
+        exit_reason="stop_loss",
+        current_time=datetime.now(timezone.utc),
+    )
+
+    assert result is True
+
+
 def test_strategy_confirm_trade_exit_arms_cooldown_on_stop_loss(sas) -> None:
     strategy = make_strategy(sas)
     now = datetime.now(timezone.utc)
