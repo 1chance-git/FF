@@ -42,9 +42,9 @@
     },
 
     "exchange": {
-        "name": "binanceusdm",
-        "key": "",
-        "secret": "",
+        "name": "hyperliquid",
+        "walletAddress": "",
+        "privateKey": "",
         "ccxt_config": {},
         "ccxt_async_config": {},
         "pair_whitelist": [
@@ -53,7 +53,7 @@
         ],
         "pair_blacklist": []
     },
-    "//exchange_credentials": "API key/secret intentionally blank here. Supply real credentials via user_data/config-private.json (gitignored), merged with: freqtrade trade -c user_data/config.json -c user_data/config-private.json",
+    "//exchange_credentials": "Hyperliquid is a DEX authenticated by wallet, not an API key/secret pair. walletAddress is the public account address; privateKey signs orders and must never be committed. Both are intentionally blank here — supply real values via user_data/config-private.json (gitignored), merged with: freqtrade trade -c user_data/config.json -c user_data/config-private.json",
 
     "pairlists": [
         {

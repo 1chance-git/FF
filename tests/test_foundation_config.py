@@ -38,6 +38,20 @@ def test_futures_isolated_usdc(config: dict) -> None:
     assert config["stake_currency"] == "USDC"
 
 
+def test_exchange_is_hyperliquid(config: dict) -> None:
+    """The project trades on the Hyperliquid DEX, not a centralized exchange."""
+    assert config["exchange"]["name"] == "hyperliquid"
+
+
+def test_no_wallet_credentials_committed(config: dict) -> None:
+    """walletAddress/privateKey must stay blank in the committed config.
+
+    Real credentials belong only in the gitignored config-private.json.
+    """
+    assert config["exchange"]["walletAddress"] == ""
+    assert config["exchange"]["privateKey"] == ""
+
+
 def test_static_pairlist_restricted_to_btc_eth_usdc(config: dict) -> None:
     """Only BTC/USDC and ETH/USDC futures pairs should be tradable."""
     methods = [entry["method"] for entry in config["pairlists"]]

@@ -1,9 +1,9 @@
 """End-to-end startup verification for the foundation project.
 
-This sandbox's network policy blocks outbound calls to Binance, so a true
-network smoke test (``freqtrade trade``) cannot reach ``fapi.binance.com``
-here. That is an environment restriction, not a configuration defect: the
-same config works unmodified wherever outbound HTTPS to Binance is
+This sandbox's network policy blocks outbound calls to exchange APIs, so a
+true network smoke test (``freqtrade trade``) cannot reach Hyperliquid's
+API here. That is an environment restriction, not a configuration defect:
+the same config works unmodified wherever outbound HTTPS to Hyperliquid is
 permitted.
 
 To still prove that configuration parsing, strategy resolution, and
@@ -105,8 +105,9 @@ def test_freqtradebot_starts_with_project_config() -> None:
     }
     fake_ccxt_api.precisionMode = 2
     fake_ccxt_api.options = {}
-    fake_ccxt_api.id = "binanceusdm"
-    fake_ccxt_api.name = "Binance USDⓈ-M"
+    fake_ccxt_api.id = "hyperliquid"
+    fake_ccxt_api.name = "Hyperliquid"
+    fake_ccxt_api.walletAddress = "0x0000000000000000000000000000000000000000"
 
     with (
         patch(

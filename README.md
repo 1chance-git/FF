@@ -14,7 +14,7 @@ correct before any strategy code is written.
 | Trading mode         | `futures`                                     |
 | Margin mode           | `isolated`                                    |
 | Stake currency        | `USDC`                                        |
-| Exchange              | `binanceusdm` (Binance USDⓈ-M futures)         |
+| Exchange              | `hyperliquid` (Hyperliquid perpetuals DEX)      |
 | Pairlist               | `StaticPairList` restricted to `BTC/USDC:USDC`, `ETH/USDC:USDC` |
 | Default mode          | `dry_run: true` (paper trading, no real orders) |
 
@@ -28,9 +28,19 @@ comments explaining each non-obvious choice.
   abstraction (via `ccxt`), backtester, risk controls, and persistence
   layer. Building any of that from scratch would duplicate work a large
   open-source project has already solved well.
-* **`binanceusdm` exchange id.** Binance splits spot and USDⓈ-M futures
-  into separate ccxt exchange classes. `binanceusdm` is the one Freqtrade
-  officially supports for isolated/cross USDC/USDT-margined futures.
+* **`hyperliquid` exchange id.** Hyperliquid is a fully on-chain perpetuals
+  DEX with a mature, officially-supported Freqtrade/ccxt integration
+  (`freqtrade.exchange.hyperliquid.Hyperliquid`). It natively margins
+  perpetuals in USDC and supports both isolated and cross margin, so it
+  fits this project's USDC/isolated requirements directly rather than
+  needing a USDC-margined product bolted onto a USDT-native exchange.
+* **Wallet-based credentials, not an API key/secret pair.** Hyperliquid
+  authenticates orders by signing them with a wallet private key rather
+  than issuing exchange-side API keys (`ccxt.hyperliquid`'s
+  `requiredCredentials` are `walletAddress` + `privateKey`, not
+  `apiKey`/`secret`). `user_data/config.json` declares both fields blank;
+  real values are supplied only through the gitignored
+  `config-private.json`, exactly like the other secrets below.
 * **`StaticPairList` only.** Later modules (pair selection, cointegration
   screening) will decide *which* pairs to trade statistically. Until that
   logic exists, the pairlist is hard-restricted to exactly the two pairs
@@ -89,7 +99,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 cp user_data/config-private.json.example user_data/config-private.json
-# edit user_data/config-private.json with real exchange API keys, etc.
+# edit user_data/config-private.json with your real wallet address/private key, etc.
 ```
 
 ### Running
@@ -103,15 +113,15 @@ freqtrade trade -c user_data/config.json -c user_data/config-private.json
 ```
 
 > **Note on this development sandbox:** the environment this project was
-> scaffolded in blocks outbound network access to `fapi.binance.com`, so
-> `freqtrade trade` cannot complete its live market-data handshake here.
-> That is a network policy of this sandbox, not a defect in the
-> configuration — the same config starts normally wherever outbound
-> HTTPS to Binance is allowed. `tests/test_bot_startup.py` proves this by
-> constructing the real `FreqtradeBot` against the committed config with
-> only the network boundary (ccxt market loading) mocked out; every other
-> step (config validation, exchange/strategy resolution, pairlist
-> handling, persistence init) runs unmodified.
+> scaffolded in blocks outbound network access to exchange APIs, so
+> `freqtrade trade` cannot complete its live market-data handshake with
+> Hyperliquid here. That is a network policy of this sandbox, not a
+> defect in the configuration — the same config starts normally wherever
+> outbound HTTPS to Hyperliquid is allowed. `tests/test_bot_startup.py`
+> proves this by constructing the real `FreqtradeBot` against the
+> committed config with only the network boundary (ccxt market loading)
+> mocked out; every other step (config validation, exchange/strategy
+> resolution, pairlist handling, persistence init) runs unmodified.
 
 ### Tests
 

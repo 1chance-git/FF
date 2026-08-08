@@ -2,8 +2,8 @@
     "//": "Copy this file to user_data/config-private.json and fill in real values. That file is gitignored and must never be committed.",
 
     "exchange": {
-        "key": "your-binance-usdm-api-key",
-        "secret": "your-binance-usdm-api-secret"
+        "walletAddress": "0xYourPublicWalletAddress",
+        "privateKey": "your-wallet-private-key-never-share-this"
     },
 
     "telegram": {
