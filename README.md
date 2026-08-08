@@ -71,11 +71,16 @@ comments explaining each non-obvious choice.
 
 ```
 FF/
+├── pyproject.toml                # stat_arb package metadata + pytest config
 ├── requirements.txt              # pinned Freqtrade version
 ├── .gitignore
+├── stat_arb/                     # project code, independent of user_data/
+│   └── data/
+│       └── market_data.py        # market data loading/cleaning/validation/alignment
 ├── tests/
 │   ├── test_foundation_config.py # config.json + strategy sanity checks
-│   └── test_bot_startup.py       # full FreqtradeBot construction (network mocked)
+│   ├── test_bot_startup.py       # full FreqtradeBot construction (network mocked)
+│   └── test_market_data.py       # market data layer unit tests
 └── user_data/
     ├── config.json                    # committed, no secrets
     ├── config-private.json.example    # template — copy to config-private.json
@@ -126,9 +131,95 @@ freqtrade trade -c user_data/config.json -c user_data/config-private.json
 ### Tests
 
 ```bash
-pip install pytest
-python3 -m pytest tests/ -v
+pip install -r requirements-dev.txt
+pytest -v
 ```
+
+## Market data module
+
+`stat_arb.data.market_data` loads, cleans, validates, and aligns OHLCV
+candle data for `BTC/USDC:USDC` and `ETH/USDC:USDC`. It contains **no
+indicators or trading logic** — that is deliberately out of scope for
+this module.
+
+### What it does
+
+* **Loads** candle data from Freqtrade's on-disk candle store
+  (`user_data/data/hyperliquid/`) via `MarketDataLoader`, one pair or
+  several at once.
+* **Handles missing candles** by delegating to Freqtrade's own
+  `clean_ohlcv_dataframe` / `ohlcv_fill_up_missing_data`: gaps are
+  filled with the previous close (zero volume), the standard convention
+  for "no trades happened in this interval."
+* **Aligns timestamps** across pairs by taking the intersection of
+  available timestamps (`align_pairs`) — required before any cross-pair
+  statistic (spread, correlation, cointegration) can be computed, since
+  those assume row *i* of both series is the same point in time.
+* **Validates dataframe integrity** (`validate_ohlcv`): required
+  columns present, no null/duplicate/unsorted timestamps, no
+  null/negative/non-positive values, and the OHLC relationship
+  (`low <= open, close <= high`) holds for every row. All violations
+  found are reported together, not just the first.
+* **`MarketDataService`** composes all of the above into one call:
+  load → clean & fill → validate → align → validate again.
+
+### Design decisions
+
+* **Reuses Freqtrade's history/converter code instead of reimplementing
+  it.** `freqtrade.data.history.load_pair_history` already reads the
+  exact on-disk format `freqtrade download-data` and the live bot both
+  write. `freqtrade.data.converter.clean_ohlcv_dataframe` already
+  de-duplicates and gap-fills OHLCV data using logic exercised by a
+  large production user base. This module is a thin, typed,
+  validated orchestration layer on top of both — reimplementing either
+  would duplicate mature code for no benefit.
+* **Loading and processing are separated.** `MarketDataLoader` is the
+  only piece that touches disk. `clean_and_fill`, `validate_ohlcv`, and
+  `align_pairs` are pure functions over in-memory dataframes, so unit
+  tests exercise gap-filling, validation, and alignment logic directly
+  with synthetic data — no filesystem or exchange dependency required
+  for the core logic.
+* **Validation raises, it doesn't warn.** Silently accepting a corrupt
+  dataframe (duplicate timestamps, an OHLC violation, an unfilled gap)
+  would let bad data flow into statistical models downstream, where
+  it's much harder to trace back to its source.
+* **Alignment is an inner join, not a forward-fill across pairs.**
+  Forward-filling one pair's price to cover a timestamp the other pair
+  has no data for would fabricate a data point. Taking the intersection
+  of timestamps instead guarantees both series in a pair only ever share
+  timestamps that both genuinely have data for.
+
+### Usage
+
+```python
+from pathlib import Path
+
+from freqtrade.enums import CandleType
+from stat_arb.data.market_data import MarketDataLoader, MarketDataService
+
+loader = MarketDataLoader(
+    datadir=Path("user_data/data/hyperliquid"),
+    timeframe="5m",
+    candle_type=CandleType.FUTURES,
+)
+service = MarketDataService(loader)
+
+data = service.get_aligned_market_data(["BTC/USDC:USDC", "ETH/USDC:USDC"])
+# data["BTC/USDC:USDC"] and data["ETH/USDC:USDC"] are cleaned, gap-filled,
+# validated DataFrames sharing an identical `date` index.
+```
+
+Candle data must be downloaded first, e.g.:
+
+```bash
+freqtrade download-data -c user_data/config.json \
+    -p BTC/USDC:USDC ETH/USDC:USDC -t 5m --trading-mode futures
+```
+
+> This sandbox blocks outbound access to exchange APIs (see the note
+> above), so `download-data` cannot run here. `tests/test_market_data.py`
+> covers the loader/service against locally-written synthetic candle
+> files, so the module is fully verified without needing live data.
 
 ### Next module
 
