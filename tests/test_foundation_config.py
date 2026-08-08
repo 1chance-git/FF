@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.unit
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = REPO_ROOT / "user_data" / "config.json"
 STRATEGY_PATH = REPO_ROOT / "user_data" / "strategies" / "FoundationStrategy.py"

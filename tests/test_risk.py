@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+pytestmark = pytest.mark.unit
+
 from stat_arb.risk.risk import (
     CooldownConfig,
     CooldownTracker,

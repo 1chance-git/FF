@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+
+pytestmark = pytest.mark.unit
 from freqtrade.data.history.datahandlers import get_datahandler
 from freqtrade.enums import CandleType
 

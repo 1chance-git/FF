@@ -414,7 +414,13 @@ def compute_exit_signals(
     -------
     tuple[Series, Series]
         ``(exit_long, exit_short)`` boolean masks aligned to
-        ``dataframe``'s index.
+        ``dataframe``'s index. The two masks can be simultaneously
+        ``True`` whenever the z-score sits within the exit band of the
+        mean (``-exit_zscore <= zscore <= exit_zscore``) — that is
+        intentional, not a bug: Freqtrade only ever applies whichever
+        exit signal matches a given trade's actual open side, so "exit
+        if long" and "exit if short" both being true near the mean is
+        exactly the desired behavior, not a contradictory signal.
     """
     zscore = dataframe["zscore"]
     valid = zscore.notna()

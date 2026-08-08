@@ -7,6 +7,8 @@ import logging
 
 import pytest
 
+pytestmark = pytest.mark.unit
+
 from hermes.logging_config import LoggingConfig, configure_logging, get_logger
 
 

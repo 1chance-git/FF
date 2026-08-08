@@ -26,6 +26,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+pytestmark = pytest.mark.unit
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STRATEGY_PATH = REPO_ROOT / "user_data" / "strategies" / "StatArbSwing.py"
 

@@ -12,11 +12,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from hermes.backtest import BacktestResult
 from hermes.cli import cli
 from hermes.health import CheckResult, HealthReport, HealthStatus
+
+pytestmark = pytest.mark.unit
 
 
 def test_cli_help() -> None:

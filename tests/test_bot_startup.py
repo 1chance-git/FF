@@ -19,8 +19,11 @@ strategy loading, persistence/db init — runs unmodified.
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 from freqtrade.configuration import Configuration
 from freqtrade.freqtradebot import FreqtradeBot
+
+pytestmark = pytest.mark.unit
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = REPO_ROOT / "user_data" / "config.json"

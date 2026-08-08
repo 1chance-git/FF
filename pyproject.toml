@@ -17,3 +17,10 @@ include = ["stat_arb*", "hermes*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "unit: fast, isolated unit tests of a single function/class",
+    "strategy: strategy-level validation (config/interface conformance, no-lookahead)",
+    "backtest: full offline backtest runs through freqtrade's real backtesting engine",
+    "regression: golden/pinned-value tests guarding against unintended behavior drift",
+    "numerical: cross-implementation and invariant numerical consistency checks",
+]

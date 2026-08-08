@@ -89,18 +89,24 @@ FF/
 │   ├── process.py                # process lifecycle + restart support
 │   └── cli.py                    # `hermes` CLI (click + rich)
 ├── tests/
-│   ├── test_foundation_config.py # config.json + strategy sanity checks
-│   ├── test_bot_startup.py       # full FreqtradeBot construction (network mocked)
-│   ├── test_market_data.py       # market data layer unit tests
-│   ├── test_regression.py        # rolling regression engine unit tests
-│   ├── test_cointegration.py     # stat-arb engine unit tests
-│   ├── test_risk.py              # risk engine unit tests
-│   ├── test_stat_arb_swing.py    # assembled strategy unit tests
-│   ├── test_hermes_logging.py    # hermes logging unit tests
-│   ├── test_hermes_health.py     # hermes health check unit tests
-│   ├── test_hermes_backtest.py   # hermes backtest launcher unit tests
-│   ├── test_hermes_process.py    # hermes process lifecycle unit tests
-│   └── test_hermes_cli.py        # hermes CLI unit tests
+│   ├── README.md                       # test suite organization, categories, fixtures
+│   ├── conftest.py                     # shared fixtures (synthetic data, mocked exchange)
+│   ├── test_foundation_config.py       # config.json + strategy sanity checks
+│   ├── test_bot_startup.py             # full FreqtradeBot construction (network mocked)
+│   ├── test_market_data.py             # market data layer unit tests
+│   ├── test_regression.py              # rolling regression engine unit tests
+│   ├── test_cointegration.py           # stat-arb engine unit tests
+│   ├── test_risk.py                    # risk engine unit tests
+│   ├── test_stat_arb_swing.py          # assembled strategy unit tests
+│   ├── test_hermes_logging.py          # hermes logging unit tests
+│   ├── test_hermes_health.py           # hermes health check unit tests
+│   ├── test_hermes_backtest.py         # hermes backtest launcher unit tests
+│   ├── test_hermes_process.py          # hermes process lifecycle unit tests
+│   ├── test_hermes_cli.py              # hermes CLI unit tests
+│   ├── test_strategy_validation.py     # assembled-strategy interface + no-lookahead validation
+│   ├── test_backtest_validation.py     # real, fully offline end-to-end backtest runs
+│   ├── test_golden_values.py           # regression tests: pinned golden values
+│   └── test_numerical_consistency.py   # cross-implementation + invariant checks
 └── user_data/
     ├── config.json                    # committed, no secrets
     ├── config-private.json.example    # template — copy to config-private.json
@@ -155,6 +161,11 @@ freqtrade trade -c user_data/config.json -c user_data/config-private.json
 pip install -r requirements-dev.txt
 pytest -v
 ```
+
+See [`tests/README.md`](tests/README.md) for the full test suite —
+unit, strategy validation, backtest validation, regression (golden
+values), and numerical consistency tests, each selectable via
+`pytest -m <marker>`.
 
 ## Market data module
 
@@ -625,6 +636,66 @@ hermes stop -c user_data/config.json --strategy StatArbSwing
 # Structured JSON logs alongside the console output:
 hermes --json-log-file user_data/logs/hermes.log start -c user_data/config.json --strategy StatArbSwing
 ```
+
+## Testing suite
+
+275 tests across five categories — full details, per-category
+breakdown, and shared fixtures are documented in
+[`tests/README.md`](tests/README.md). Summary:
+
+* **Unit tests** (`-m unit`, 220 tests) — one file per module, testing
+  its public API in isolation with synthetic data.
+* **Strategy validation** (`-m strategy`, 12 tests) — the *assembled*
+  `StatArbSwing` against Freqtrade's own config/strategy consistency
+  checks, plus no-lookahead validated through the composed
+  `populate_indicators` → `populate_entry_trend` → `populate_exit_trend`
+  pipeline (not just within each `stat_arb` module feeding it).
+* **Backtest validation** (`-m backtest`, 8 tests) — Freqtrade's real
+  backtesting engine, run fully offline against synthetic local data
+  with only the network boundary mocked, validating the assembled
+  system produces a coherent result: both pair legs actually trade,
+  position sizing reconciles, the stop loss is respected, and repeated
+  runs are deterministic.
+* **Regression tests** (`-m regression`, 6 tests) — golden/pinned
+  numeric values on a fixed seeded dataset, guarding against
+  unintended behavior drift that a property-based correctness test
+  wouldn't catch.
+* **Numerical consistency** (`-m numerical`, 29 tests) — cross-checks
+  against independent implementations (`numpy.linalg.lstsq`,
+  `scipy.stats.linregress`, direct `statsmodels` calls) and arithmetic
+  invariants (`units * price == notional`, determinism).
+
+### Design decisions
+
+* **The backtest-validation suite runs Freqtrade's real engine, not a
+  simplified stand-in.** Mocking only the network boundary (exchange
+  market loading — the same technique `test_bot_startup.py`
+  established for constructing a real `FreqtradeBot`) and running
+  everything else for real is strictly more trustworthy than a
+  hand-rolled backtest simulator: every config-validation rule,
+  every accounting detail, every interaction between Freqtrade and the
+  strategy's hooks is the actual code that runs in production.
+* **Synthetic data for backtest validation is deliberately engineered,
+  not just seeded-random.** `make_oscillating_cointegrated_pair` adds a
+  sinusoidal deviation on top of the cointegrating relationship so the
+  spread reliably crosses entry/exit thresholds — a backtest that
+  "completes successfully" while silently producing zero trades would
+  pass a weaker test suite without ever exercising the entry/exit
+  logic at all.
+* **Golden-value tests are a distinct category from correctness
+  tests, on purpose.** A test asserting "the hedge ratio is close to
+  the true beta" and a test asserting "the hedge ratio at this exact
+  point is 1.846089405611601" catch different failure modes — the
+  first catches broken statistics, the second catches *any* behavior
+  change at all, intentional or not, forcing it to be reviewed rather
+  than silently shipped.
+* **Numerical consistency checks lean on independent libraries, not
+  just internal re-derivation.** Cross-checking against
+  `scipy.stats.linregress` and direct `statsmodels` calls (rather than
+  only against our own helper functions written differently) is
+  stronger evidence of correctness, since a shared bug between our
+  wrapper and a hand-rolled numpy check wouldn't be caught by the
+  numpy check either.
 
 ### Next module
 
