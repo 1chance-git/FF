@@ -88,12 +88,14 @@ FF/
 │   ├── test_market_data.py       # market data layer unit tests
 │   ├── test_regression.py        # rolling regression engine unit tests
 │   ├── test_cointegration.py     # stat-arb engine unit tests
-│   └── test_risk.py              # risk engine unit tests
+│   ├── test_risk.py              # risk engine unit tests
+│   └── test_stat_arb_swing.py    # assembled strategy unit tests
 └── user_data/
     ├── config.json                    # committed, no secrets
     ├── config-private.json.example    # template — copy to config-private.json
     ├── strategies/
-    │   └── FoundationStrategy.py      # no-op strategy skeleton
+    │   ├── FoundationStrategy.py      # no-op strategy skeleton
+    │   └── StatArbSwing.py            # assembled pairs-trading strategy
     ├── data/                          # downloaded candle data (gitignored)
     ├── logs/                          # rotating log files (gitignored)
     ├── backtest_results/
@@ -449,7 +451,87 @@ if decision.allowed:
 engine.record_exit("BTC/USDC:USDC", exit_time, stop_loss_triggered=True)
 ```
 
+## Assembled strategy: StatArbSwing
+
+`user_data/strategies/StatArbSwing.py` is the Freqtrade `IStrategy`
+that assembles all four modules above into a live, tradable pairs
+strategy for the project's two-pair universe (`ETH/USDC:USDC` as the
+"y" leg, `BTC/USDC:USDC` as the "x"/hedge leg). **No AI/ML component is
+used anywhere** — every signal and decision comes from the closed-form
+statistical and rule-based logic already built and tested in the four
+modules; a unit test parses the strategy file's imports to enforce that
+no ML framework (`freqAI`, `torch`, `sklearn`, etc.) is ever pulled in.
+
+### How the modules compose
+
+* **`populate_indicators()`** — fetches the *other* leg's OHLCV via the
+  dataprovider, cleans/aligns both legs
+  (`stat_arb.data.market_data.clean_and_fill` / `align_pairs` /
+  `validate_ohlcv`), fits the rolling hedge ratio
+  (`stat_arb.signal.regression.RollingRegressionEngine`), computes the
+  spread/z-score with an Engle-Granger cointegration check
+  (`stat_arb.signal.cointegration.CointegrationEngine`), and classifies
+  the spread's regime and trend (`stat_arb.risk.risk.detect_regime` /
+  `compute_trend_filter`) — merging all of it back onto Freqtrade's
+  per-pair dataframe without changing its row count.
+* **`populate_entry_trend()`** — enters long/short based on the z-score
+  threshold, direction flipped depending on whether the current pair is
+  the "y" or "x" leg (so both legs get coordinated, opposite-direction
+  signals for the same spread event), gated by the regime, trend, and
+  cointegration flags computed above.
+* **`populate_exit_trend()`** — exits once the z-score has reverted
+  toward the mean past a (smaller) exit threshold.
+* **Risk engine integration beyond the vectorized hooks** —
+  `custom_stake_amount` sizes every entry via
+  `stat_arb.risk.risk.calculate_position_size`; `confirm_trade_entry`
+  applies the risk engine's *stateful* controls (cooldown, portfolio
+  exposure) that need live wallet/position state unavailable during
+  vectorized backtesting; `confirm_trade_exit` arms the cooldown via
+  `RiskEngine.record_exit` whenever `exit_reason == "stop_loss"`. The
+  base `stoploss = -0.05` class attribute and the risk engine's
+  `StopLossConfig` share one `STOP_LOSS_PCT` constant so they can't
+  drift out of sync.
+
+### Design decisions
+
+* **Every real decision is a pure, freqtrade-independent function.**
+  `determine_pair_role`, `build_aligned_closes`, `compute_pair_indicators`,
+  `compute_entry_signals`, `compute_exit_signals`, and
+  `positions_notional_from_trades` all take/return plain
+  `pandas`/primitive types and are unit-tested directly — `StatArbSwing`
+  itself is a thin adapter wiring Freqtrade's hooks to them.
+* **Both legs are traded, driven by the same spread.** Genuine pairs
+  trading needs both legs executed with opposite exposure. Since
+  Freqtrade calls each hook once per pair, this strategy computes the
+  *same* spread/z-score inside each call and flips entry/exit direction
+  based on which leg is currently being evaluated.
+* **Cointegration is validated once per indicator refresh, not per row.**
+  Engle-Granger is a whole-sample test by construction — it isn't meant
+  to be re-run per historical bar. Its result is broadcast across the
+  refresh and naturally updates as new data arrives on each subsequent
+  call.
+* **Regime detection and the trend filter run on the spread, not raw
+  price** — that's the actual question this strategy needs answered:
+  is the *spread* mean-reverting right now, or trending away from it.
+* **Two complementary gating layers.** `populate_entry_trend` carries
+  the vectorized statistical filters Freqtrade's backtester can
+  evaluate historically; `confirm_trade_entry` adds the stateful checks
+  (cooldown, exposure) that only make sense with live portfolio state.
+  Both read from the same `RiskEngine` instance, so there's one source
+  of truth for every threshold.
+
+### Usage
+
+```bash
+# Backtest (once historical BTC/USDC and ETH/USDC futures data is downloaded)
+freqtrade backtesting -c user_data/config.json --strategy StatArbSwing
+
+# Dry-run
+freqtrade trade -c user_data/config.json -c user_data/config-private.json \
+    --strategy StatArbSwing
+```
+
 ### Next module
 
-Pair selection screening across candidate pairs and entry/exit signal
-generation — not yet started.
+Hyperparameter tuning / hyperopt space and a dedicated backtest report —
+not yet started.
