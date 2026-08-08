@@ -77,15 +77,18 @@ FF/
 ├── stat_arb/                     # project code, independent of user_data/
 │   ├── data/
 │   │   └── market_data.py        # market data loading/cleaning/validation/alignment
-│   └── signal/
-│       ├── regression.py         # rolling OLS hedge-ratio engine
-│       └── cointegration.py      # spread/z-score + cointegration validation
+│   ├── signal/
+│   │   ├── regression.py         # rolling OLS hedge-ratio engine
+│   │   └── cointegration.py      # spread/z-score + cointegration validation
+│   └── risk/
+│       └── risk.py               # independent risk engine (no Freqtrade dependency)
 ├── tests/
 │   ├── test_foundation_config.py # config.json + strategy sanity checks
 │   ├── test_bot_startup.py       # full FreqtradeBot construction (network mocked)
 │   ├── test_market_data.py       # market data layer unit tests
 │   ├── test_regression.py        # rolling regression engine unit tests
-│   └── test_cointegration.py     # stat-arb engine unit tests
+│   ├── test_cointegration.py     # stat-arb engine unit tests
+│   └── test_risk.py              # risk engine unit tests
 └── user_data/
     ├── config.json                    # committed, no secrets
     ├── config-private.json.example    # template — copy to config-private.json
@@ -362,6 +365,88 @@ result.rolling_mean     # trailing rolling mean of the spread
 result.rolling_std      # trailing rolling standard deviation of the spread
 result.zscore           # trailing rolling z-score — the signal input
 result.cointegration    # CointegrationTestResult (Engle-Granger)
+```
+
+## Risk engine
+
+`stat_arb.risk.risk` is an **independent risk-decision layer with no
+dependency on Freqtrade** — every function and class operates on plain
+`pandas`/`numpy`/primitive-Python types, so it can be tested, reused from
+a backtester, or driven by a different execution engine entirely without
+ever importing `freqtrade`. It contains six independent controls,
+composed by `RiskEngine.evaluate_entry()` into one allow/deny decision:
+
+* **Stop loss** — fixed 5% adverse-move stop
+  (`compute_stop_loss_price` / `is_stop_loss_triggered`).
+* **Position sizing** — fixed-fractional sizing from the stop distance,
+  capped by `max_position_pct_of_equity` and `max_leverage`
+  (`calculate_position_size`).
+* **Regime detection** — classifies each rolling window as
+  mean-reverting or trending via the Engle-Granger pair's own
+  Augmented Dickey-Fuller test, applied locally (`detect_regime`).
+* **Trend filter** — a faster, separate check: the statistical
+  significance of a rolling linear time-trend slope, via
+  `statsmodels.RollingOLS` (`compute_trend_filter`).
+* **Maximum exposure** — gross, per-pair, and position-count limits
+  (`check_exposure_limits`).
+* **Cooldown logic** — blocks re-entry on a pair for a configurable
+  period after a stop-loss exit (`CooldownTracker`).
+
+### Design decisions
+
+* **No Freqtrade dependency, by requirement.** The engine is a pure
+  decision layer — given prices, equity, and current positions, it
+  decides whether and how large an entry should be — kept free of
+  `freqtrade` imports so it can be exercised in isolation and reused
+  anywhere. A unit test parses the module's AST to enforce this
+  directly (`test_risk_module_does_not_import_freqtrade`), not just by
+  convention.
+* **Regime detection reuses `statsmodels.tsa.stattools.adfuller`**, the
+  same ADF implementation that validates cointegration elsewhere in this
+  project, rather than a custom stationarity heuristic — applied per
+  rolling window (documented as more expensive than a closed-form
+  indicator; intended for periodic checks, not tick-by-tick).
+* **The trend filter reuses `statsmodels.RollingOLS`** (already a
+  project dependency) to regress price on a linear time index and test
+  the slope's significance, rather than a hand-rolled moving-average
+  crossover — giving a statistically grounded, cheap answer that is
+  deliberately independent of (and can disagree with) the ADF-based
+  regime classification.
+* **Position sizing is capped by explicit exposure bounds, not just risk
+  amount.** Sizing purely from the stop distance can produce an
+  unbounded position when the stop is very tight; every size is also
+  capped by `max_position_pct_of_equity` and `max_leverage`, with the
+  binding cap reported on the result rather than applied silently.
+* **`CooldownTracker` is the one deliberately mutable class in the
+  module.** Every other config here is a frozen dataclass; a cooldown
+  tracker's entire job is to remember exit history across calls, so
+  immutability would defeat its purpose. Its state is scoped to exactly
+  what it needs: `pair -> last qualifying exit time`.
+* **Only stop-loss exits arm the cooldown by default.** A trade closed
+  for a normal reason isn't evidence the pair or timing was bad; a
+  stop-loss exit is. `CooldownConfig(apply_to_all_exits=True)` opts into
+  cooling down after every exit instead.
+
+### Usage
+
+```python
+from datetime import datetime, timezone
+from stat_arb.risk.risk import RiskEngine, RiskEngineConfig, PositionSide
+
+engine = RiskEngine(RiskEngineConfig())
+decision = engine.evaluate_entry(
+    pair="BTC/USDC:USDC",
+    side=PositionSide.LONG,
+    entry_price=50_000.0,
+    equity=10_000.0,
+    prices=spread_series,       # recent spread/price history
+    current_positions={},        # pair -> current notional
+    current_time=datetime.now(timezone.utc),
+)
+
+if decision.allowed:
+    ...  # place the order sized at decision.position_size.units
+engine.record_exit("BTC/USDC:USDC", exit_time, stop_loss_triggered=True)
 ```
 
 ### Next module
