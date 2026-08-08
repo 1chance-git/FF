@@ -1,0 +1,21 @@
+{
+    "//": "Copy this file to user_data/config-private.json and fill in real values. That file is gitignored and must never be committed.",
+
+    "exchange": {
+        "walletAddress": "0xYourPublicWalletAddress",
+        "privateKey": "your-wallet-private-key-never-share-this"
+    },
+
+    "telegram": {
+        "enabled": false,
+        "token": "your-telegram-bot-token",
+        "chat_id": "your-telegram-chat-id"
+    },
+
+    "api_server": {
+        "jwt_secret_key": "generate-with-python -c \"import secrets; print(secrets.token_hex(32))\"",
+        "ws_token": "generate-with-python -c \"import secrets; print(secrets.token_hex(32))\"",
+        "username": "choose-a-username",
+        "password": "choose-a-strong-password"
+    }
+}

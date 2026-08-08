@@ -1,0 +1,121 @@
+{
+    "$schema": "https://schema.freqtrade.io/schema.json",
+    "//": "Foundation config: futures / isolated margin / USDC stake. No trading logic yet.",
+
+    "trading_mode": "futures",
+    "margin_mode": "isolated",
+
+    "max_open_trades": 2,
+    "stake_currency": "USDC",
+    "stake_amount": "unlimited",
+    "tradable_balance_ratio": 0.99,
+    "fiat_display_currency": "USD",
+
+    "dry_run": true,
+    "dry_run_wallet": 1000,
+    "cancel_open_orders_on_exit": false,
+
+    "timeframe": "5m",
+
+    "unfilledtimeout": {
+        "entry": 10,
+        "exit": 10,
+        "exit_timeout_count": 0,
+        "unit": "minutes"
+    },
+
+    "entry_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1,
+        "price_last_balance": 0.0,
+        "check_depth_of_market": {
+            "enabled": false,
+            "bids_to_ask_delta": 1
+        }
+    },
+
+    "exit_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1
+    },
+
+    "exchange": {
+        "name": "hyperliquid",
+        "walletAddress": "",
+        "privateKey": "",
+        "ccxt_config": {},
+        "ccxt_async_config": {},
+        "pair_whitelist": [
+            "BTC/USDC:USDC",
+            "ETH/USDC:USDC"
+        ],
+        "pair_blacklist": []
+    },
+    "//exchange_credentials": "Hyperliquid is a DEX authenticated by wallet, not an API key/secret pair. walletAddress is the public account address; privateKey signs orders and must never be committed. Both are intentionally blank here — supply real values via user_data/config-private.json (gitignored), merged with: freqtrade trade -c user_data/config.json -c user_data/config-private.json",
+
+    "pairlists": [
+        {
+            "method": "StaticPairList"
+        }
+    ],
+
+    "telegram": {
+        "enabled": false,
+        "token": "",
+        "chat_id": ""
+    },
+
+    "//api_server_security": "enabled is false by default. jwt_secret_key/ws_token/username/password below are placeholders, deliberately committed to git history and therefore NOT secret -- before ever setting enabled=true, override every one of these via user_data/config-private.json (see config-private.json.example), which is gitignored. Never flip enabled=true on the committed values as-is.",
+    "api_server": {
+        "enabled": false,
+        "listen_ip_address": "127.0.0.1",
+        "listen_port": 8080,
+        "verbosity": "error",
+        "enable_openapi": false,
+        "jwt_secret_key": "INSECURE_PLACEHOLDER_COMMITTED_TO_GIT_REPLACE_VIA_CONFIG_PRIVATE_JSON",
+        "ws_token": "INSECURE_PLACEHOLDER_COMMITTED_TO_GIT_REPLACE_VIA_CONFIG_PRIVATE_JSON",
+        "CORS_origins": [],
+        "username": "changeme",
+        "password": "changeme"
+    },
+
+    "bot_name": "ff-stat-arb",
+    "strategy": "FoundationStrategy",
+    "strategy_path": "user_data/strategies",
+    "initial_state": "running",
+    "force_entry_enable": false,
+
+    "internals": {
+        "process_throttle_secs": 5
+    },
+
+    "log_config": {
+        "version": 1,
+        "disable_existing_loggers": false,
+        "formatters": {
+            "standard": {
+                "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+            }
+        },
+        "handlers": {
+            "console": {
+                "class": "logging.StreamHandler",
+                "formatter": "standard",
+                "stream": "ext://sys.stdout"
+            },
+            "file": {
+                "class": "logging.handlers.RotatingFileHandler",
+                "formatter": "standard",
+                "filename": "user_data/logs/freqtrade.log",
+                "maxBytes": 10485760,
+                "backupCount": 10
+            }
+        },
+        "root": {
+            "handlers": ["console", "file"],
+            "level": "INFO"
+        }
+    }
+}

@@ -1,0 +1,7 @@
+-r requirements.txt
+pytest==8.3.5
+
+# tests/test_numerical_consistency.py cross-checks against scipy directly.
+# Already a transitive dependency of statsmodels; pinned explicitly since
+# the test suite imports it.
+scipy==1.17.1

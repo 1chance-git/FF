@@ -1,0 +1,31 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Hermes runtime state
+*.pid
+user_data/hermes.pid
+
+# Freqtrade secrets and runtime state
+user_data/config-private.json
+user_data/logs/*
+!user_data/logs/.gitkeep
+user_data/data/*
+!user_data/data/.gitkeep
+user_data/backtest_results/*
+!user_data/backtest_results/.gitkeep
+user_data/hyperopt_results/*
+!user_data/hyperopt_results/.gitkeep
+user_data/freqaimodels/*
+!user_data/freqaimodels/.gitkeep
+user_data/notebooks/.ipynb_checkpoints/
+*.sqlite
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stat-arb"
+version = "0.1.0"
+description = "Statistical arbitrage trading system built on Freqtrade."
+requires-python = ">=3.11"
+
+[project.scripts]
+hermes = "hermes.cli:main"
+optimize-cli = "optimize.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["stat_arb*", "hermes*", "optimize*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "unit: fast, isolated unit tests of a single function/class",
+    "strategy: strategy-level validation (config/interface conformance, no-lookahead)",
+    "backtest: full offline backtest runs through freqtrade's real backtesting engine",
+    "regression: golden/pinned-value tests guarding against unintended behavior drift",
+    "numerical: cross-implementation and invariant numerical consistency checks",
+]
