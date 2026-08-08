@@ -75,12 +75,15 @@ FF/
 ├── requirements.txt              # pinned Freqtrade version
 ├── .gitignore
 ├── stat_arb/                     # project code, independent of user_data/
-│   └── data/
-│       └── market_data.py        # market data loading/cleaning/validation/alignment
+│   ├── data/
+│   │   └── market_data.py        # market data loading/cleaning/validation/alignment
+│   └── signal/
+│       └── regression.py         # rolling OLS hedge-ratio engine
 ├── tests/
 │   ├── test_foundation_config.py # config.json + strategy sanity checks
 │   ├── test_bot_startup.py       # full FreqtradeBot construction (network mocked)
-│   └── test_market_data.py       # market data layer unit tests
+│   ├── test_market_data.py       # market data layer unit tests
+│   └── test_regression.py        # rolling regression engine unit tests
 └── user_data/
     ├── config.json                    # committed, no secrets
     ├── config-private.json.example    # template — copy to config-private.json
@@ -220,6 +223,73 @@ freqtrade download-data -c user_data/config.json \
 > above), so `download-data` cannot run here. `tests/test_market_data.py`
 > covers the loader/service against locally-written synthetic candle
 > files, so the module is fully verified without needing live data.
+
+## Rolling regression engine
+
+`stat_arb.signal.regression` fits a rolling OLS regression across two
+aligned price series (e.g. the outputs of `MarketDataService`) and
+produces a dynamic hedge ratio — the beta a pairs trader uses to size
+the offsetting leg of a spread trade at each point in time. It contains
+**no spread/z-score/signal-generation logic** — that is deliberately out
+of scope for this module.
+
+### What it does
+
+* **Rolling OLS via `statsmodels`.** `RollingRegressionEngine.fit(y, x)`
+  runs `statsmodels.regression.rolling.RollingOLS` on
+  `y = intercept + hedge_ratio * x` over a configurable window,
+  producing a `RollingRegressionResult` with a full `hedge_ratio` series
+  (one estimate per timestamp, not a single static beta).
+* **Validates numerical stability per window.** Each window's design
+  matrix condition number is computed (closed-form, vectorized — see
+  `_rolling_condition_number`) and combined with a sanity bound on the
+  hedge ratio's magnitude. Windows failing either check are flagged
+  `is_stable=False`; their hedge ratio is forward-filled from the last
+  stable estimate by default (`ffill_unstable=True`), never silently
+  trusted as-is.
+* **Logs hedge ratio changes.** Every relative change in the (stable)
+  hedge ratio at or above `hedge_ratio_change_log_threshold` (default
+  5%) is logged at `INFO`, along with a `WARNING` summary whenever any
+  window is flagged numerically unstable.
+
+### Design decisions
+
+* **`statsmodels.RollingOLS` does the regression math**, not a hand-rolled
+  windowed `numpy.linalg.lstsq` loop — it is mature, correctly handles
+  window edges and missing data, and updates incrementally rather than
+  refitting from scratch every step.
+* **Condition number is computed analytically from rolling sums**, not
+  via a per-window `numpy.linalg.cond` call in a Python loop. For the
+  two-column design matrix `[1, x]`, `X'X` is a 2x2 matrix built from
+  `x.rolling().sum()` and `(x**2).rolling().sum()`, whose eigenvalues
+  (and hence the 2-norm condition number) have a closed form — verified
+  in the tests to match `numpy.linalg.cond` exactly, at a fraction of the
+  cost.
+* **Unstable windows are forward-filled, not dropped.** Downstream
+  consumers need a hedge ratio at every timestamp; a stale-but-trustworthy
+  estimate is safer than a numerically meaningless one. Callers who want
+  raw `NaN` gaps instead can set `ffill_unstable=False`.
+* **Only significant hedge-ratio changes are logged**, not every
+  window-to-window fluctuation — logging every step of a rolling
+  statistic would flood the log with routine noise instead of surfacing
+  the regime shifts a pairs trader actually needs to know about.
+* **The engine is pair-agnostic.** It doesn't know or care which pair
+  leg is `y` vs. `x` — that assignment is a decision for the (not yet
+  built) pair-selection/signal-generation module.
+
+### Usage
+
+```python
+from stat_arb.signal.regression import RollingRegressionEngine, RollingRegressionConfig
+
+engine = RollingRegressionEngine(RollingRegressionConfig(window=60))
+result = engine.fit(y=btc_close, x=eth_close)
+
+result.hedge_ratio       # dynamic hedge ratio, unstable windows forward-filled
+result.is_stable         # per-window stability flag
+result.condition_number  # per-window design-matrix condition number
+result.n_unstable        # count of windows without a stable estimate
+```
 
 ### Next module
 

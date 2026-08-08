@@ -1,1 +1,2 @@
 freqtrade==2026.7
+statsmodels==0.14.6
