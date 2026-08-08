@@ -1,12 +1,12 @@
 # Test suite
 
-275 tests across five categories, selectable via `pytest -m <marker>`
+344 tests across five categories, selectable via `pytest -m <marker>`
 (markers registered in `pyproject.toml`).
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                    # everything (~30s)
-pytest -m unit             # fast, isolated unit tests only (~13s)
+pytest                    # everything (~35s)
+pytest -m unit             # fast, isolated unit tests only (~14s)
 pytest -m strategy         # strategy validation
 pytest -m backtest         # full offline backtest runs (~15s)
 pytest -m regression       # golden/pinned-value tests
@@ -15,7 +15,7 @@ pytest -m numerical        # cross-implementation & invariant checks
 
 ## Categories
 
-### Unit tests (`-m unit`, 220 tests)
+### Unit tests (`-m unit`, 286 tests)
 
 One file per module under test, testing that module's public API in
 isolation with synthetic data:
@@ -30,8 +30,14 @@ isolation with synthetic data:
 | `test_risk.py` | `stat_arb.risk.risk` — stop loss, sizing, regime/trend, exposure, cooldown |
 | `test_stat_arb_swing.py` | `StatArbSwing`'s pure helper functions and individual Freqtrade hooks |
 | `test_hermes_*.py` | `hermes/` — logging, health checks, backtest launcher, process lifecycle, CLI |
+| `test_hyperopt_loss.py` | `optimize.hyperopt_loss.StatArbHyperOptLoss` |
+| `test_hyperopt_launcher.py` | `optimize.hyperopt_launcher` — hyperopt command building/launching |
+| `test_grid_search.py` | `optimize.grid_search` — grid/random parameter search |
+| `test_walk_forward.py` | `optimize.walk_forward` — window generation, runner orchestration |
+| `test_reporting.py` | `optimize.reporting` — performance statistics and rendering |
+| `test_optimize_cli.py` | `optimize.cli` — the `optimize-cli` command surface |
 
-### Strategy validation (`-m strategy`, `test_strategy_validation.py`, 12 tests)
+### Strategy validation (`-m strategy`, `test_strategy_validation.py`, 15 tests)
 
 Validates the *assembled* `StatArbSwing` strategy object against
 Freqtrade's own interface contract — distinct from the per-hook unit
@@ -51,6 +57,13 @@ tests in `test_stat_arb_swing.py`:
   market-data alignment step).
 * Entry signals are directionally mutually exclusive (never
   `enter_long` and `enter_short` on the same candle).
+* **The hyperopt parameters actually work**: `entry_zscore_param`/
+  `exit_zscore_param` default to `ENTRY_ZSCORE`/`EXIT_ZSCORE` (so normal
+  behavior is unaffected outside a hyperopt run), sit in the expected
+  `buy`/`sell` spaces, and — the test that actually validates the wiring
+  rather than just its inertness — overriding `.value` on a live
+  strategy instance (exactly what Freqtrade's hyperopt engine does
+  between epochs) measurably changes `populate_entry_trend`'s output.
 
 ### Backtest validation (`-m backtest`, `test_backtest_validation.py`, 8 tests)
 
@@ -106,6 +119,31 @@ Two kinds of checks:
   regardless of input (`units * price == notional`, `|entry - stop| /
   entry == stop_loss_pct`), and determinism (identical input must
   produce byte-identical output across repeated calls).
+
+### Optimization framework (`-m unit`, 49 tests across 6 files)
+
+Tests for `optimize/` (see the root README's "Optimization framework"
+section for the module-by-module design rationale):
+
+* `test_hyperopt_loss.py` — `StatArbHyperOptLoss` returns a finite loss
+  for real results, the fixed sentinel for too few trades, rewards
+  higher Sharpe / penalizes drawdown as documented, and is a valid
+  `IHyperOptLoss` subclass.
+* `test_hyperopt_launcher.py` — command building (pure function tests)
+  plus mocked-subprocess and one genuine real-subprocess (`--help`) run,
+  mirroring `test_hermes_backtest.py`'s pattern.
+* `test_grid_search.py` — grid and random search verified against a
+  synthetic quadratic-bowl objective with a known analytic optimum,
+  including determinism-given-a-seed and tie-breaking behavior.
+* `test_walk_forward.py` — window generation (contiguous/overlapping/
+  too-short-range edge cases) and `WalkForwardRunner` orchestration
+  against synthetic optimizer/evaluator callables.
+* `test_reporting.py` — every statistic in `PerformanceReport` is
+  cross-checked directly against the underlying `freqtrade.data.metrics`
+  call it wraps, confirming the report is a thin, correct composition
+  rather than a parallel reimplementation that could silently drift.
+* `test_optimize_cli.py` — the `optimize-cli` command surface (`hyperopt`,
+  `report`), mirroring `test_hermes_cli.py`'s pattern.
 
 ## Shared fixtures (`conftest.py`)
 

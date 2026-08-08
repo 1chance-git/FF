@@ -9,3 +9,8 @@ click==8.4.2
 rich==15.0.0
 psutil==7.2.2
 python-json-logger==4.1.0
+
+# optimize/ optimization framework: freqtrade's hyperopt engine is
+# Optuna-based; Optuna is an optional "hyperopt" extra of freqtrade, not
+# a base dependency, so it's pinned explicitly here.
+optuna==4.9.0

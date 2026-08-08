@@ -88,6 +88,13 @@ FF/
 │   ├── backtest.py               # backtest launcher (subprocess)
 │   ├── process.py                # process lifecycle + restart support
 │   └── cli.py                    # `hermes` CLI (click + rich)
+├── optimize/                     # optimization framework (own CLI, decoupled from stat_arb)
+│   ├── hyperopt_loss.py          # custom IHyperOptLoss (Sharpe - drawdown penalty)
+│   ├── hyperopt_launcher.py      # `freqtrade hyperopt` launcher (subprocess)
+│   ├── grid_search.py            # Freqtrade-independent grid/random parameter search
+│   ├── walk_forward.py           # rolling train/test window generation + orchestration
+│   ├── reporting.py              # performance report (freqtrade.data.metrics + rich)
+│   └── cli.py                    # `optimize-cli` CLI (click + rich)
 ├── tests/
 │   ├── README.md                       # test suite organization, categories, fixtures
 │   ├── conftest.py                     # shared fixtures (synthetic data, mocked exchange)
@@ -106,7 +113,13 @@ FF/
 │   ├── test_strategy_validation.py     # assembled-strategy interface + no-lookahead validation
 │   ├── test_backtest_validation.py     # real, fully offline end-to-end backtest runs
 │   ├── test_golden_values.py           # regression tests: pinned golden values
-│   └── test_numerical_consistency.py   # cross-implementation + invariant checks
+│   ├── test_numerical_consistency.py   # cross-implementation + invariant checks
+│   ├── test_hyperopt_loss.py           # optimize hyperopt loss function unit tests
+│   ├── test_hyperopt_launcher.py       # optimize hyperopt launcher unit tests
+│   ├── test_grid_search.py             # optimize grid/random search unit tests
+│   ├── test_walk_forward.py            # optimize walk-forward unit tests
+│   ├── test_reporting.py               # optimize performance reporting unit tests
+│   └── test_optimize_cli.py            # optimize CLI unit tests
 └── user_data/
     ├── config.json                    # committed, no secrets
     ├── config-private.json.example    # template — copy to config-private.json
@@ -637,15 +650,106 @@ hermes stop -c user_data/config.json --strategy StatArbSwing
 hermes --json-log-file user_data/logs/hermes.log start -c user_data/config.json --strategy StatArbSwing
 ```
 
+## Optimization framework
+
+`optimize/` provides hyperopt configuration, parameter search, walk-
+forward testing, and performance reporting for `StatArbSwing` — built
+alongside `hermes/` (both treat Freqtrade as an external process to
+launch, never something to reimplement) but scoped specifically to
+tuning and validating the strategy's parameters rather than operating
+the live bot.
+
+### What it does
+
+* **Hyperopt configuration.** `StatArbSwing.py` now exposes
+  `entry_zscore_param`/`exit_zscore_param` as Freqtrade
+  `DecimalParameter`s (in the standard `buy`/`sell` spaces), and
+  `optimize/hyperopt_loss.py` defines `StatArbHyperOptLoss` — a custom
+  `IHyperOptLoss` combining Sharpe ratio and max drawdown (both via
+  `freqtrade.data.metrics`) into one risk-adjusted objective.
+  `optimize/hyperopt_launcher.py`'s `HyperoptLauncher` builds and runs
+  `freqtrade hyperopt` as a subprocess, wiring `--hyperopt-path` at the
+  package itself so Freqtrade finds the loss function automatically.
+* **Parameter search.** `optimize/grid_search.py` provides `grid_search`/
+  `random_search` — a lightweight, **Freqtrade-independent** sweep over
+  any objective function, for quick coarse searches or parameters
+  outside Freqtrade's hyperopt space entirely (e.g. sweeping
+  `stat_arb.risk.risk.RiskEngineConfig` fields directly).
+* **Walk-forward testing.** `optimize/walk_forward.py`'s
+  `generate_windows` produces rolling train/test date-range pairs;
+  `WalkForwardRunner` orchestrates optimize-on-train /
+  evaluate-on-test across them via injected callables, reporting every
+  window's out-of-sample score (not just an average) so regime-
+  dependent overfitting shows up rather than averaging out.
+* **Performance reporting.** `optimize/reporting.py`'s
+  `compute_performance_report` assembles Sharpe/Sortino/Calmar/max
+  drawdown/expectancy/SQN — every one a direct call into
+  `freqtrade.data.metrics`, never reimplemented — into one
+  `PerformanceReport`, rendered as a `rich` table matching `hermes`'s
+  CLI output style.
+
+### Design decisions
+
+* **Freqtrade's own hyperopt engine (Optuna-based) does the actual
+  parameter search**, not a custom optimizer — `HyperoptLauncher`
+  launches the real `freqtrade hyperopt` CLI exactly the way
+  `hermes.backtest.BacktestLauncher` launches `freqtrade backtesting`:
+  build an argv, run it as a subprocess, return a structured result.
+* **Hyperopt parameters are deliberately scoped to entry/exit
+  thresholds only, not window sizes.** Tuning `REGRESSION_WINDOW` et al.
+  would require Freqtrade's more expensive "indicator space" hyperopt
+  mode and reconstructing `risk_engine` (and its stateful
+  `CooldownTracker`) every epoch — added complexity and live-trading
+  risk not worth it over tuning just the thresholds, which Freqtrade's
+  standard `buy`/`sell` spaces already handle cheaply and safely.
+* **`grid_search`/`random_search` take an injected objective function
+  and know nothing about Freqtrade at all** — the same
+  dependency-injection pattern `hermes.health.HealthChecker` uses —
+  keeping the search algorithm itself fully unit-testable against a
+  synthetic objective (a quadratic bowl with a known optimum),
+  independent of whether a real backtest can run in the current
+  environment.
+* **Walk-forward's optimizer/evaluator are injected callables, not
+  hardcoded to `HyperoptLauncher`/`hermes.backtest.BacktestLauncher`.**
+  This makes `WalkForwardRunner`'s orchestration — window sequencing,
+  per-window result aggregation — testable with fast synthetic
+  stand-ins, while production callers wire in the real launchers.
+* **Every reported statistic is a direct call into
+  `freqtrade.data.metrics`.** Sharpe/Sortino/Calmar/drawdown/expectancy/
+  SQN each have real subtleties (annualization convention, drawdown
+  base) Freqtrade's own implementations already get right; a parallel
+  reimplementation would only risk silently drifting from them.
+
+### Usage
+
+```bash
+pip install -e .   # registers the `optimize-cli` console command
+
+optimize-cli hyperopt -c user_data/config.json --strategy StatArbSwing --epochs 100
+optimize-cli report --trades-file trades.json --starting-balance 10000
+```
+
+```python
+from datetime import date, timedelta
+from optimize.walk_forward import generate_windows, WalkForwardRunner
+
+windows = generate_windows(
+    date(2024, 1, 1), date(2024, 7, 1),
+    train_period=timedelta(days=60), test_period=timedelta(days=14),
+)
+report = WalkForwardRunner(optimizer=my_optimizer, evaluator=my_evaluator).run(windows)
+print(report.mean_out_of_sample_score, report.worst_window)
+```
+
 ## Testing suite
 
-275 tests across five categories — full details, per-category
+344 tests across five categories — full details, per-category
 breakdown, and shared fixtures are documented in
 [`tests/README.md`](tests/README.md). Summary:
 
-* **Unit tests** (`-m unit`, 220 tests) — one file per module, testing
+* **Unit tests** (`-m unit`, 286 tests) — one file per module, testing
   its public API in isolation with synthetic data.
-* **Strategy validation** (`-m strategy`, 12 tests) — the *assembled*
+* **Strategy validation** (`-m strategy`, 15 tests) — the *assembled*
   `StatArbSwing` against Freqtrade's own config/strategy consistency
   checks, plus no-lookahead validated through the composed
   `populate_indicators` → `populate_entry_trend` → `populate_exit_trend`
@@ -699,5 +803,5 @@ breakdown, and shared fixtures are documented in
 
 ### Next module
 
-Hyperparameter tuning / hyperopt space and a dedicated backtest report —
-not yet started.
+Deployment automation (CI/CD, remote monitoring dashboards) — not yet
+started.

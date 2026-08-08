@@ -216,3 +216,61 @@ def test_full_pipeline_no_entry_signal_before_startup_candle_count() -> None:
     warmup = df.iloc[: strategy.startup_candle_count - 1]
     assert (warmup["enter_long"] == 0).all()
     assert (warmup["enter_short"] == 0).all()
+
+
+# ---------------------------------------------------------------------------
+# Hyperopt configuration (optimize/ framework)
+# ---------------------------------------------------------------------------
+
+
+def test_hyperopt_parameters_default_to_the_strategy_constants(resolved_strategy: IStrategy) -> None:
+    """entry_zscore_param/exit_zscore_param must default to ENTRY_ZSCORE/EXIT_ZSCORE.
+
+    Outside of an active hyperopt run, `.value` equals each parameter's
+    `default=`, so normal dry-run/live/backtest behavior must be
+    unaffected by their existence.
+    """
+    assert resolved_strategy.entry_zscore_param.value == pytest.approx(
+        resolved_strategy.ENTRY_ZSCORE
+    )
+    assert resolved_strategy.exit_zscore_param.value == pytest.approx(
+        resolved_strategy.EXIT_ZSCORE
+    )
+
+
+def test_hyperopt_parameters_are_in_the_expected_spaces(resolved_strategy: IStrategy) -> None:
+    """entry_zscore_param is a 'buy'-space, exit_zscore_param a 'sell'-space parameter.
+
+    This is what makes `freqtrade hyperopt --spaces buy sell` (see
+    optimize.hyperopt_launcher.HyperoptConfig's default spaces) actually
+    tune them.
+    """
+    assert resolved_strategy.entry_zscore_param.space == "buy"
+    assert resolved_strategy.exit_zscore_param.space == "sell"
+
+
+def test_full_pipeline_reads_hyperopt_parameter_value_dynamically() -> None:
+    """Overriding entry_zscore_param.value must change actual entry signals.
+
+    This is the behavior Freqtrade's hyperopt engine relies on: it
+    mutates a live parameter's `.value` between epochs on one
+    long-lived strategy instance (rather than re-constructing the
+    strategy), so populate_entry_trend must read `.value` at call time,
+    not a value captured once in __init__. Asserting this directly
+    (rather than only checking the default) is what actually validates
+    the hyperopt wiring works, not just that it's inert by default.
+    """
+    sas = _load_strategy_module()
+    y_ohlcv, x_ohlcv = make_oscillating_cointegrated_pair(n=400)
+    strategy = sas.StatArbSwing({"stake_currency": "USDC", "runmode": None})
+
+    baseline_df = _run_full_pipeline(strategy, y_ohlcv.copy(), x_ohlcv)
+    baseline_entries = int(baseline_df["enter_long"].sum() + baseline_df["enter_short"].sum())
+
+    # A much smaller threshold should fire strictly more (or equal, in a
+    # degenerate all-zero case) entry signals than the default 2.0.
+    strategy.entry_zscore_param.value = 0.1
+    lowered_df = _run_full_pipeline(strategy, y_ohlcv.copy(), x_ohlcv)
+    lowered_entries = int(lowered_df["enter_long"].sum() + lowered_df["enter_short"].sum())
+
+    assert lowered_entries > baseline_entries

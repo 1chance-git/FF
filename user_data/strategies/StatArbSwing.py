@@ -97,7 +97,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from freqtrade.persistence import Trade
-from freqtrade.strategy import IStrategy
+from freqtrade.strategy import DecimalParameter, IStrategy
 
 from stat_arb.data.market_data import (
     MarketDataError,
@@ -513,6 +513,26 @@ class StatArbSwing(IStrategy):
     BLOCK_ENTRY_WHEN_TRENDING: bool = True
     REQUIRE_COINTEGRATION: bool = True
 
+    # Hyperopt-tunable counterparts of ENTRY_ZSCORE/EXIT_ZSCORE, read by
+    # populate_entry_trend/populate_exit_trend in place of the plain
+    # constants above. `.value` defaults to ENTRY_ZSCORE/EXIT_ZSCORE
+    # outside of a hyperopt run, so normal dry-run/live/backtest behavior
+    # is unchanged; `freqtrade hyperopt --spaces buy sell` (see
+    # optimize/hyperopt_launcher.py) tunes these directly. Deliberately
+    # scoped to entry/exit thresholds only, not the window sizes that
+    # feed indicator computation (REGRESSION_WINDOW etc.) — tuning those
+    # would require Freqtrade's more expensive "indicator space" hyperopt
+    # mode and reconstructing `risk_engine` (and its stateful
+    # CooldownTracker) per epoch, which isn't worth the added complexity
+    # and risk to this strategy's live-trading semantics for the
+    # marginal benefit over tuning just the thresholds.
+    entry_zscore_param = DecimalParameter(
+        1.0, 4.0, default=ENTRY_ZSCORE, decimals=2, space="buy", optimize=True, load=True
+    )
+    exit_zscore_param = DecimalParameter(
+        0.0, 1.5, default=EXIT_ZSCORE, decimals=2, space="sell", optimize=True, load=True
+    )
+
     # -- Window configuration (bars) --------------------------------------
     REGRESSION_WINDOW: int = 60
     SPREAD_WINDOW: int = 40
@@ -613,7 +633,7 @@ class StatArbSwing(IStrategy):
         enter_long, enter_short = compute_entry_signals(
             dataframe,
             role,
-            self.ENTRY_ZSCORE,
+            self.entry_zscore_param.value,
             self.REQUIRE_MEAN_REVERTING_REGIME,
             self.BLOCK_ENTRY_WHEN_TRENDING,
             self.REQUIRE_COINTEGRATION,
@@ -633,7 +653,7 @@ class StatArbSwing(IStrategy):
         if role is None or "zscore" not in dataframe.columns:
             return dataframe
 
-        exit_long, exit_short = compute_exit_signals(dataframe, role, self.EXIT_ZSCORE)
+        exit_long, exit_short = compute_exit_signals(dataframe, role, self.exit_zscore_param.value)
         dataframe.loc[exit_long, "exit_long"] = 1
         dataframe.loc[exit_short, "exit_short"] = 1
         return dataframe

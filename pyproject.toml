@@ -10,9 +10,10 @@ requires-python = ">=3.11"
 
 [project.scripts]
 hermes = "hermes.cli:main"
+optimize-cli = "optimize.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["stat_arb*", "hermes*"]
+include = ["stat_arb*", "hermes*", "optimize*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
