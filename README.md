@@ -78,12 +78,14 @@ FF/
 │   ├── data/
 │   │   └── market_data.py        # market data loading/cleaning/validation/alignment
 │   └── signal/
-│       └── regression.py         # rolling OLS hedge-ratio engine
+│       ├── regression.py         # rolling OLS hedge-ratio engine
+│       └── cointegration.py      # spread/z-score + cointegration validation
 ├── tests/
 │   ├── test_foundation_config.py # config.json + strategy sanity checks
 │   ├── test_bot_startup.py       # full FreqtradeBot construction (network mocked)
 │   ├── test_market_data.py       # market data layer unit tests
-│   └── test_regression.py        # rolling regression engine unit tests
+│   ├── test_regression.py        # rolling regression engine unit tests
+│   └── test_cointegration.py     # stat-arb engine unit tests
 └── user_data/
     ├── config.json                    # committed, no secrets
     ├── config-private.json.example    # template — copy to config-private.json
@@ -291,7 +293,78 @@ result.condition_number  # per-window design-matrix condition number
 result.n_unstable        # count of windows without a stable estimate
 ```
 
+## Statistical arbitrage engine
+
+`stat_arb.signal.cointegration` computes the pair spread and its rolling
+mean/standard deviation/z-score from a price pair and a hedge ratio
+(typically the output of `RollingRegressionEngine`), and validates that
+the pair is actually cointegrated before treating any of that as a
+trading signal input. It contains **no entry/exit rule logic** — that is
+deliberately out of scope for this module.
+
+### What it does
+
+* **Computes the spread**: `spread = y - hedge_ratio * x`.
+* **Rolling mean, standard deviation, and z-score** of the spread, all
+  via trailing (never centered) `pandas` rolling windows.
+* **Cointegration validation** via the Engle-Granger test
+  (`statsmodels.tsa.stattools.coint`). `CointegrationEngine.compute()`
+  raises `CointegrationError` by default if the pair fails the test —
+  a spread built on a non-cointegrated pair isn't mean-reverting, and a
+  z-score computed on it isn't a meaningful signal.
+* **Prevents lookahead bias** at both of its possible entry points:
+  rolling statistics are always trailing (`center=False`, not exposed as
+  a toggle), and the hedge ratio is lagged (`hedge_ratio_lag`, default
+  1 bar) before being applied to the spread, so the hedge ratio used at
+  bar *t* was estimated using no information from bar *t* itself.
+
+### Design decisions
+
+* **Cointegration testing uses `statsmodels.tsa.stattools.coint`**
+  (Engle-Granger), a mature, well-tested implementation — reimplementing
+  the underlying augmented Dickey-Fuller regression and critical-value
+  tables would duplicate established statistical code for no benefit.
+* **Cointegration validation gates spread computation by default.** A
+  non-cointegrated pair's spread is just noise dressed up as a signal;
+  `require_cointegration=True` (the default) refuses to produce one.
+  Set it to `False` for research/exploration where fitting anyway is
+  useful.
+* **The hedge ratio is lagged even though the rolling regression is
+  already trailing.** A trailing regression window ending at bar *t*
+  technically uses no *future* data, but it does include bar *t*'s own
+  price — and since OLS explicitly minimizes each window's total squared
+  residual, bar *t*'s own residual is disproportionately shrunk by a fit
+  that was partly optimized around it. That in-sample shrinkage makes
+  the spread look more mean-reverting than an honest out-of-sample
+  hedge ratio would. Lagging the hedge ratio by (by default) one bar
+  removes this specific bias; the module logs a warning if a caller
+  explicitly sets `hedge_ratio_lag=0`.
+* **A degenerate rolling standard deviation produces `NaN`, not `inf`.**
+  Dividing by a standard deviation that has collapsed to numerical noise
+  would produce a huge, meaningless z-score; `zscore_std_floor` treats
+  those windows as unavailable data instead.
+* **Lookahead prevention is directly unit-tested, not just asserted in
+  a docstring.** `test_rolling_zscore_unaffected_by_future_perturbation`
+  and similar tests perturb a *future* observation and assert every
+  *earlier* output is byte-for-byte unchanged — the concrete, falsifiable
+  form of "no lookahead bias."
+
+### Usage
+
+```python
+from stat_arb.signal.cointegration import CointegrationEngine, CointegrationConfig
+
+engine = CointegrationEngine(CointegrationConfig(spread_window=60, hedge_ratio_lag=1))
+result = engine.compute(y=btc_close, x=eth_close, hedge_ratio=hedge_ratio)
+
+result.spread          # y - lagged_hedge_ratio * x
+result.rolling_mean     # trailing rolling mean of the spread
+result.rolling_std      # trailing rolling standard deviation of the spread
+result.zscore           # trailing rolling z-score — the signal input
+result.cointegration    # CointegrationTestResult (Engle-Granger)
+```
+
 ### Next module
 
-Pair selection / cointegration screening for `BTC/USDC` and `ETH/USDC`
-futures — not yet started.
+Pair selection screening across candidate pairs and entry/exit signal
+generation — not yet started.
