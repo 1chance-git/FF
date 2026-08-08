@@ -82,6 +82,12 @@ FF/
 │   │   └── cointegration.py      # spread/z-score + cointegration validation
 │   └── risk/
 │       └── risk.py               # independent risk engine (no Freqtrade dependency)
+├── hermes/                       # operational tooling (own CLI, decoupled from stat_arb)
+│   ├── logging_config.py         # structured JSON + rich console logging
+│   ├── health.py                 # health checks via freqtrade_client
+│   ├── backtest.py               # backtest launcher (subprocess)
+│   ├── process.py                # process lifecycle + restart support
+│   └── cli.py                    # `hermes` CLI (click + rich)
 ├── tests/
 │   ├── test_foundation_config.py # config.json + strategy sanity checks
 │   ├── test_bot_startup.py       # full FreqtradeBot construction (network mocked)
@@ -89,7 +95,12 @@ FF/
 │   ├── test_regression.py        # rolling regression engine unit tests
 │   ├── test_cointegration.py     # stat-arb engine unit tests
 │   ├── test_risk.py              # risk engine unit tests
-│   └── test_stat_arb_swing.py    # assembled strategy unit tests
+│   ├── test_stat_arb_swing.py    # assembled strategy unit tests
+│   ├── test_hermes_logging.py    # hermes logging unit tests
+│   ├── test_hermes_health.py     # hermes health check unit tests
+│   ├── test_hermes_backtest.py   # hermes backtest launcher unit tests
+│   ├── test_hermes_process.py    # hermes process lifecycle unit tests
+│   └── test_hermes_cli.py        # hermes CLI unit tests
 └── user_data/
     ├── config.json                    # committed, no secrets
     ├── config-private.json.example    # template — copy to config-private.json
@@ -529,6 +540,90 @@ freqtrade backtesting -c user_data/config.json --strategy StatArbSwing
 # Dry-run
 freqtrade trade -c user_data/config.json -c user_data/config-private.json \
     --strategy StatArbSwing
+```
+
+## Hermes: operational tooling
+
+`hermes/` is a standalone CLI and library for operating the bot process
+this project runs — structured logging, health checks, a backtest
+launcher, and process lifecycle/restart support — kept independent of
+Freqtrade's internals and installed as its own `hermes` console command
+(`pip install -e .`).
+
+### What it does
+
+* **Structured logging** (`hermes.logging_config`) — two independent
+  output channels on the same `logging` hierarchy: JSON logs (via
+  `python-json-logger`) for machine consumption, and colorized
+  human-readable console output (via `rich`) for interactive use.
+  Idempotent — re-configuring doesn't stack duplicate handlers.
+* **Health checks** (`hermes.health`) — `HealthChecker` queries a
+  running bot's REST API through `freqtrade_client.FtRestClient` (the
+  official client library Freqtrade itself ships) and reports
+  `api_reachable`, `bot_health`, and `resources` (CPU/RAM via the bot's
+  own `/sysinfo`) as an aggregate `HealthReport` — `HEALTHY`,
+  `DEGRADED`, or `UNHEALTHY`, never raising even if the bot is
+  completely unreachable.
+* **Backtest launcher** (`hermes.backtest`) — `BacktestLauncher` builds
+  and runs `python -m freqtrade backtesting ...` as a subprocess,
+  returning a structured `BacktestResult` (exit code, stdout/stderr,
+  duration) rather than raising on a failed backtest.
+* **Restart support** (`hermes.process`) — `BotProcessManager` tracks
+  the bot via a PID file, `start`/`stop`/`restart`/`status`, with
+  graceful `SIGTERM`-then-`SIGKILL` shutdown; `RestartSupervisor` adds a
+  bounded, exponentially-backed-off retry loop (2s → 4s → 8s → 16s
+  capped) for unattended crash recovery.
+* **CLI-friendly output** (`hermes.cli`) — a `click`-based CLI
+  (`hermes health` / `backtest` / `start` / `stop` / `restart` /
+  `status`) rendering `rich` tables and colored status text, with
+  process exit codes that reflect outcome (e.g. `hermes health` exits
+  `1` if unhealthy) for scripting.
+
+### Design decisions
+
+* **Every mature library is reused, not reimplemented.** `FtRestClient`
+  for the API protocol, `python-json-logger` for JSON formatting,
+  `rich` for terminal rendering, `click` for CLI parsing, `psutil` for
+  cross-platform process management — each is exactly the kind of
+  fiddly-to-get-right, already-solved problem this project's other
+  modules also avoid reinventing (e.g. `statsmodels` for regression and
+  cointegration).
+* **Freqtrade is managed as an external process, never imported and run
+  in-process.** Both the backtest launcher and the process manager
+  build an argv and hand it to `subprocess`, exactly the same
+  arm's-length relationship `StatArbSwing.py` has with `stat_arb`'s pure
+  functions — Freqtrade version upgrades that change CLI flags only
+  require touching the (thin, tested) command-builder functions.
+* **Command construction and command execution are always separate
+  functions.** `build_backtest_command`/`build_trade_command` are pure
+  (given a config, return the exact argv) and unit-tested without any
+  subprocess; `BacktestLauncher.run`/`BotProcessManager.start` are the
+  thin I/O wrappers — the same pure-vs-I/O separation used throughout
+  this project.
+* **A PID file's process identity is verified, not assumed.**
+  `BotProcessManager` confirms a PID file's process is actually a
+  freqtrade process (configurable via an injectable matcher, used by
+  tests to substitute a lightweight stand-in) before trusting it,
+  so a stale PID file pointing at an unrelated, since-reused PID
+  correctly reports "not running" instead of a false positive.
+* **Health checks never raise.** An unreachable bot is a normal,
+  expected state (starting up, mid-restart, not started yet) — it's
+  reported as `UNHEALTHY` with a clear reason, not an exception a caller
+  has to catch.
+
+### Usage
+
+```bash
+pip install -e .   # registers the `hermes` console command
+
+hermes health --api-url http://127.0.0.1:8080 --username user --password pass
+hermes backtest -c user_data/config.json --strategy StatArbSwing --timerange 20240101-20240401
+hermes start -c user_data/config.json --strategy StatArbSwing
+hermes status -c user_data/config.json --strategy StatArbSwing
+hermes stop -c user_data/config.json --strategy StatArbSwing
+
+# Structured JSON logs alongside the console output:
+hermes --json-log-file user_data/logs/hermes.log start -c user_data/config.json --strategy StatArbSwing
 ```
 
 ### Next module

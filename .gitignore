@@ -3,6 +3,11 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+*.egg-info/
+
+# Hermes runtime state
+*.pid
+user_data/hermes.pid
 
 # Freqtrade secrets and runtime state
 user_data/config-private.json
