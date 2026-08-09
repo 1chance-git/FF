@@ -310,8 +310,12 @@ def test_crash_and_restart_are_recorded_to_memory(tmp_path: Path) -> None:
     thread.join(timeout=5)
 
     assert not thread.is_alive()
-    event_types = [e.event_type for e in memory_store.get_process_events()]
-    assert event_types == ["start", "crash", "start", "stop"]
+    events = memory_store.get_process_events()
+    event_types = [e.event_type for e in events]
+    assert event_types == ["start", "crash", "restart", "start", "restart", "stop"]
+    # The "restart attempt succeeded" event carries the recovered pid.
+    restart_events = [e for e in events if e.event_type == "restart"]
+    assert all(e.message is not None for e in restart_events)
 
 
 def test_restarts_exhausted_records_a_critical_error(tmp_path: Path) -> None:
@@ -368,4 +372,4 @@ def test_broken_memory_store_does_not_interrupt_supervision(
     thread.join(timeout=5)
 
     assert not thread.is_alive()
-    assert "Failed to record start event" in caplog.text
+    assert "[HERMES][MEMORY][ERROR] Failed to persist start event" in caplog.text

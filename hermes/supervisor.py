@@ -46,15 +46,19 @@ Design decisions
   process entrypoint calls once before `run()`; `request_stop()` itself
   has no such restriction and is what the installed handlers (or a
   test, or any other caller) actually invoke.
-* **Memory recording is optional and never allowed to affect supervision.**
-  `Supervisor` takes an optional `hermes.memory.MemoryStore` and records
-  start/crash/stop events (and a final error if restarts are exhausted)
-  to it — but `MemoryStore` is injected, not constructed here, so a
-  caller that doesn't want persistence can simply omit it, and every
-  recording call is wrapped so a database failure is logged and
-  swallowed rather than interrupting supervision (the same principle
-  `StatArbSwing.confirm_trade_entry`/`confirm_trade_exit` apply to
-  trade recording).
+* **Memory recording mirrors the structured log, it doesn't replace it.**
+  Every `[HERMES][START]`/`[HERMES][CRASH]`/`[HERMES][RESTART]`/
+  `[HERMES][STOP]` line also calls `memory_store.record_process_event()`
+  (`[HERMES][HEALTH]` heartbeats do not — they aren't lifecycle events,
+  and persisting one every `health_interval_seconds` forever would swamp
+  the same append-only history trades live in). `MemoryStore` is
+  injected, not constructed here, so a caller that doesn't want
+  persistence can simply omit it.
+* **Memory failure must never crash Hermes or block a restart.** Every
+  recording call is wrapped in its own `try`/`except`; a failure is
+  logged as `[HERMES][MEMORY][ERROR]` and swallowed, never raised —
+  the same principle `StatArbSwing.confirm_trade_entry`/
+  `confirm_trade_exit` already apply to trade recording.
 """
 
 from __future__ import annotations
@@ -208,16 +212,19 @@ class Supervisor:
                 continue  # heartbeat fired; still alive
 
             if self._stop_requested.is_set():
-                _log(TAG_STOP, f"Bot exited (pid={self._process.pid}, code={exit_code})")
-                self._remember_event(TAG_STOP.lower(), pid=self._process.pid, message=f"exit code {exit_code}")
+                self._emit(
+                    TAG_STOP,
+                    f"Bot exited (pid={self._process.pid}, code={exit_code})",
+                    pid=self._process.pid,
+                )
                 return
 
-            _log(
+            self._emit(
                 TAG_CRASH,
                 f"Bot exited unexpectedly (pid={self._process.pid}, code={exit_code})",
                 level=logging.ERROR,
+                pid=self._process.pid,
             )
-            self._remember_event(TAG_CRASH.lower(), pid=self._process.pid, message=f"exit code {exit_code}")
             self._restart_with_backoff()
 
     def request_stop(self) -> None:
@@ -231,6 +238,20 @@ class Supervisor:
 
     # -- internals ---------------------------------------------------
 
+    def _emit(
+        self, tag: str, message: str, *, level: int = logging.INFO, pid: int | None = None
+    ) -> None:
+        """Log a structured `[HERMES][TAG] message` line and mirror it to memory.
+
+        Used for the four process lifecycle tags (START/CRASH/RESTART/
+        STOP) only — `[HERMES][HEALTH]` heartbeats stay log-only via
+        `_log()` directly, since persisting one every
+        `health_interval_seconds` forever isn't a lifecycle event worth
+        keeping in the same append-only history as trades.
+        """
+        _log(tag, message, level=level)
+        self._remember_event(tag.lower(), pid=pid, message=message)
+
     def _remember_event(self, event_type: str, *, pid: int | None = None, message: str | None = None) -> None:
         """Best-effort record of a process event; never raises."""
         if self.memory_store is None:
@@ -239,8 +260,13 @@ class Supervisor:
             self.memory_store.record_process_event(
                 ProcessEvent(event_type=event_type, pid=pid, message=message)
             )
-        except Exception:
-            logger.exception("Failed to record %s event to Hermes memory (supervision unaffected)", event_type)
+        except Exception as exc:
+            logger.error(
+                "[HERMES][MEMORY][ERROR] Failed to persist %s event (supervision unaffected): %s",
+                event_type,
+                exc,
+                exc_info=True,
+            )
 
     def _remember_error(self, message: str) -> None:
         """Best-effort record of a fatal supervisor error; never raises."""
@@ -250,8 +276,12 @@ class Supervisor:
             self.memory_store.record_error(
                 ErrorEvent(source="hermes.supervisor", message=message, severity="critical")
             )
-        except Exception:
-            logger.exception("Failed to record error to Hermes memory (supervision unaffected)")
+        except Exception as exc:
+            logger.error(
+                "[HERMES][MEMORY][ERROR] Failed to persist error event (supervision unaffected): %s",
+                exc,
+                exc_info=True,
+            )
 
     def _start(self) -> None:
         command = self._command_builder(self.config.process_config)
@@ -269,8 +299,7 @@ class Supervisor:
 
         self._process = process
         self._start_output_threads(process)
-        _log(TAG_START, f"Bot started (pid={process.pid})")
-        self._remember_event(TAG_START.lower(), pid=process.pid)
+        self._emit(TAG_START, f"Bot started (pid={process.pid})", pid=process.pid)
 
     def _start_output_threads(self, process: subprocess.Popen) -> None:
         threading.Thread(
@@ -310,7 +339,7 @@ class Supervisor:
             if self._stop_requested.is_set():
                 return
 
-            _log(TAG_RESTART, f"Restart attempt {attempt}/{self.config.max_restarts} in {delay:.1f}s")
+            self._emit(TAG_RESTART, f"Restart attempt {attempt}/{self.config.max_restarts} in {delay:.1f}s")
             self._sleep(delay)
             if self._stop_requested.is_set():
                 return
@@ -318,25 +347,36 @@ class Supervisor:
             try:
                 self._start()
             except ProcessError as exc:
-                _log(TAG_RESTART, f"Restart attempt {attempt} failed to launch: {exc}", level=logging.ERROR)
+                self._emit(
+                    TAG_RESTART,
+                    f"Restart attempt {attempt} failed to launch: {exc}",
+                    level=logging.ERROR,
+                )
                 continue
 
             exit_code = self._wait_with_heartbeat()
             if exit_code is None:
-                _log(TAG_RESTART, f"Restart attempt {attempt} succeeded (pid={self._process.pid})")
+                self._emit(
+                    TAG_RESTART,
+                    f"Restart attempt {attempt} succeeded (pid={self._process.pid})",
+                    pid=self._process.pid,
+                )
                 return
 
             if self._stop_requested.is_set():
-                _log(TAG_STOP, f"Bot exited (pid={self._process.pid}, code={exit_code})")
-                self._remember_event(TAG_STOP.lower(), pid=self._process.pid, message=f"exit code {exit_code}")
+                self._emit(
+                    TAG_STOP,
+                    f"Bot exited (pid={self._process.pid}, code={exit_code})",
+                    pid=self._process.pid,
+                )
                 return
 
-            _log(
+            self._emit(
                 TAG_CRASH,
                 f"Restart attempt {attempt} crashed again (pid={self._process.pid}, code={exit_code})",
                 level=logging.ERROR,
+                pid=self._process.pid,
             )
-            self._remember_event(TAG_CRASH.lower(), pid=self._process.pid, message=f"exit code {exit_code}")
 
         message = f"Bot failed to restart after {self.config.max_restarts} attempts"
         self._remember_error(message)
