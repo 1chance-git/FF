@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -370,8 +371,14 @@ def test_positions_notional_defaults_leverage_to_one(sas) -> None:
 # ---------------------------------------------------------------------------
 
 
-def make_strategy(sas):
-    strategy = sas.StatArbSwing({"stake_currency": "USDC", "runmode": None})
+def make_strategy(sas, user_data_dir: str | None = None):
+    """Build a StatArbSwing instance, pointing its Hermes memory store at a
+    throwaway temp directory rather than the repo's real `user_data/` (each
+    call gets its own isolated, disposable SQLite file)."""
+    user_data_dir = user_data_dir or tempfile.mkdtemp(prefix="hermes_test_")
+    strategy = sas.StatArbSwing(
+        {"stake_currency": "USDC", "runmode": None, "user_data_dir": user_data_dir}
+    )
     return strategy
 
 
@@ -638,6 +645,248 @@ def test_strategy_confirm_trade_exit_does_not_arm_cooldown_on_normal_exit(sas) -
     )
 
     assert strategy.risk_engine.is_in_cooldown(Y_PAIR, now + timedelta(minutes=1)) is False
+
+
+# ---------------------------------------------------------------------------
+# Hermes memory wiring (confirm_trade_entry / confirm_trade_exit)
+# ---------------------------------------------------------------------------
+
+
+def _strategy_with_allowed_entry(sas, monkeypatch: pytest.MonkeyPatch):
+    """A strategy set up so confirm_trade_entry's risk gate says yes."""
+    strategy = make_strategy(sas)
+    y_df, x_df = make_cointegrated_legs(n=250)
+    strategy.dp = SimpleNamespace(get_pair_dataframe=lambda pair, timeframe: x_df)
+    indicators_df = strategy.populate_indicators(y_df.copy(), {"pair": Y_PAIR})
+    strategy.dp = SimpleNamespace(
+        get_analyzed_dataframe=lambda pair, timeframe: (indicators_df, None)
+    )
+    strategy.wallets = SimpleNamespace(get_total_stake_amount=lambda: 10_000.0)
+
+    # No live DB/session is set up in these unit tests; get_open_trades()
+    # only needs to return "no other open positions" for this scenario.
+    monkeypatch.setattr(sas.Trade, "get_open_trades", staticmethod(lambda: []))
+
+    from stat_arb.risk.risk import EntryDecision
+
+    strategy.risk_engine.evaluate_entry = lambda **kwargs: EntryDecision(
+        allowed=True,
+        reasons=(),
+        position_size=None,
+        stop_loss_price=None,
+        regime=None,
+        is_trending=None,
+    )
+    return strategy
+
+
+class FakeTrade:
+    """Minimal stand-in for freqtrade.persistence.Trade with just what
+    _record_exit reads: open_rate/open_date_utc, fee costs, funding, and
+    the two P&L calculation methods."""
+
+    def __init__(self, open_rate: float = 100.0) -> None:
+        self.open_rate = open_rate
+        self.open_date_utc = datetime.now(timezone.utc) - timedelta(hours=2)
+        self.fee_open_cost = 1.5
+        self.fee_close_cost = 1.2
+        self.funding_fees = 0.3
+
+    def calc_profit(self, rate: float) -> float:
+        return rate - self.open_rate
+
+    def calc_profit_ratio(self, rate: float) -> float:
+        return (rate - self.open_rate) / self.open_rate
+
+
+def test_confirm_trade_entry_records_a_trade_when_allowed(sas, monkeypatch: pytest.MonkeyPatch) -> None:
+    strategy = _strategy_with_allowed_entry(sas, monkeypatch)
+    now = datetime.now(timezone.utc)
+
+    allowed = strategy.confirm_trade_entry(
+        pair=Y_PAIR,
+        order_type="limit",
+        amount=1.0,
+        rate=123.0,
+        time_in_force="GTC",
+        current_time=now,
+        entry_tag=None,
+        side="long",
+    )
+
+    assert allowed is True
+    [saved] = strategy.memory_store.get_trades(pair=Y_PAIR)
+    assert saved.entry_price == 123.0
+    assert saved.side == "long"
+    assert saved.entry_time == now
+    # entry_zscore/hedge_ratio come straight from the analyzed dataframe.
+    assert saved.entry_zscore is not None
+    assert saved.hedge_ratio is not None
+
+
+def test_confirm_trade_entry_does_not_record_when_blocked(sas) -> None:
+    strategy = make_strategy(sas)  # unknown pair -> blocked before any recording
+
+    allowed = strategy.confirm_trade_entry(
+        pair="SOL/USDC:USDC",
+        order_type="limit",
+        amount=1.0,
+        rate=100.0,
+        time_in_force="GTC",
+        current_time=datetime.now(timezone.utc),
+        entry_tag=None,
+        side="long",
+    )
+
+    assert allowed is False
+    assert strategy.memory_store.get_trades() == []
+
+
+def test_confirm_trade_exit_records_a_completed_trade(sas, monkeypatch: pytest.MonkeyPatch) -> None:
+    strategy = _strategy_with_allowed_entry(sas, monkeypatch)
+    entry_time = datetime.now(timezone.utc)
+    strategy.confirm_trade_entry(
+        pair=Y_PAIR,
+        order_type="limit",
+        amount=1.0,
+        rate=100.0,
+        time_in_force="GTC",
+        current_time=entry_time,
+        entry_tag=None,
+        side="long",
+    )
+
+    exit_time = entry_time + timedelta(hours=2)
+    trade = FakeTrade(open_rate=100.0)
+    result = strategy.confirm_trade_exit(
+        pair=Y_PAIR,
+        trade=trade,
+        order_type="limit",
+        amount=1.0,
+        rate=110.0,
+        time_in_force="GTC",
+        exit_reason="exit_signal",
+        current_time=exit_time,
+    )
+
+    assert result is True
+    trades = strategy.memory_store.get_trades(pair=Y_PAIR)
+    # One row from the entry, one combined row written at exit.
+    assert len(trades) == 2
+    completed = trades[-1]
+    assert completed.exit_price == 110.0
+    assert completed.pnl == pytest.approx(10.0)
+    assert completed.pnl_pct == pytest.approx(0.1)
+    assert completed.fees == pytest.approx(2.7)
+    assert completed.funding == pytest.approx(0.3)
+    assert completed.exit_reason == "exit_signal"
+    assert completed.holding_time_seconds == pytest.approx(7200.0)
+    assert completed.entry_price == 100.0
+    # The pending context was consumed.
+    assert Y_PAIR not in strategy._pending_entry_context
+
+
+def test_confirm_trade_exit_without_prior_entry_context_still_records(sas) -> None:
+    """A restart between entry and exit shouldn't lose the exit record, only the entry context."""
+    strategy = make_strategy(sas)
+    now = datetime.now(timezone.utc)
+    trade = FakeTrade(open_rate=100.0)
+
+    result = strategy.confirm_trade_exit(
+        pair=Y_PAIR,
+        trade=trade,
+        order_type="limit",
+        amount=1.0,
+        rate=90.0,
+        time_in_force="GTC",
+        exit_reason="stop_loss",
+        current_time=now,
+    )
+
+    assert result is True
+    [saved] = strategy.memory_store.get_trades(pair=Y_PAIR)
+    assert saved.exit_price == 90.0
+    assert saved.pnl == pytest.approx(-10.0)
+    assert saved.entry_zscore is None  # no entry context available
+    assert saved.entry_price == 100.0  # fell back to trade.open_rate
+
+
+def test_memory_store_failure_does_not_block_entry_or_exit(sas, monkeypatch: pytest.MonkeyPatch) -> None:
+    strategy = _strategy_with_allowed_entry(sas, monkeypatch)
+
+    class ExplodingMemoryStore:
+        def record_trade(self, *args, **kwargs):
+            raise RuntimeError("simulated disk failure")
+
+    strategy.memory_store = ExplodingMemoryStore()
+
+    allowed = strategy.confirm_trade_entry(
+        pair=Y_PAIR,
+        order_type="limit",
+        amount=1.0,
+        rate=100.0,
+        time_in_force="GTC",
+        current_time=datetime.now(timezone.utc),
+        entry_tag=None,
+        side="long",
+    )
+    assert allowed is True
+
+    result = strategy.confirm_trade_exit(
+        pair=Y_PAIR,
+        trade=FakeTrade(),
+        order_type="limit",
+        amount=1.0,
+        rate=105.0,
+        time_in_force="GTC",
+        exit_reason="exit_signal",
+        current_time=datetime.now(timezone.utc),
+    )
+    assert result is True
+
+
+def test_memory_store_none_does_not_block_entry_or_exit(sas, monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the store failed to initialize entirely (self.memory_store is None)."""
+    strategy = _strategy_with_allowed_entry(sas, monkeypatch)
+    strategy.memory_store = None
+
+    allowed = strategy.confirm_trade_entry(
+        pair=Y_PAIR,
+        order_type="limit",
+        amount=1.0,
+        rate=100.0,
+        time_in_force="GTC",
+        current_time=datetime.now(timezone.utc),
+        entry_tag=None,
+        side="long",
+    )
+    assert allowed is True
+
+    result = strategy.confirm_trade_exit(
+        pair=Y_PAIR,
+        trade=FakeTrade(),
+        order_type="limit",
+        amount=1.0,
+        rate=105.0,
+        time_in_force="GTC",
+        exit_reason="exit_signal",
+        current_time=datetime.now(timezone.utc),
+    )
+    assert result is True
+
+
+def test_latest_signal_context_pure_helper(sas) -> None:
+    df = pd.DataFrame({"zscore": [float("nan"), 1.5, 2.0], "hedge_ratio": [1.1, 1.2, 1.3]})
+    context = sas.latest_signal_context(df)
+    assert context["zscore"] == 2.0
+    assert context["hedge_ratio"] == 1.3
+    assert context["regime"] is None  # column absent
+
+
+def test_latest_signal_context_handles_all_nan_column(sas) -> None:
+    df = pd.DataFrame({"zscore": [float("nan"), float("nan")]})
+    context = sas.latest_signal_context(df)
+    assert context["zscore"] is None
 
 
 def test_strategy_resolves_via_freqtrade_strategy_resolver() -> None:

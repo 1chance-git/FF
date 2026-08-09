@@ -126,6 +126,8 @@ from stat_arb.risk.risk import (
     compute_stop_loss_price,
 )
 
+from hermes.memory import MemoryStore, TradeRecord
+
 logger = logging.getLogger(__name__)
 
 ROLE_Y = "y"
@@ -192,6 +194,38 @@ def build_aligned_closes(
     y_close = aligned[y_pair].set_index("date")["close"]
     x_close = aligned[x_pair].set_index("date")["close"]
     return y_close, x_close
+
+
+def latest_signal_context(analyzed: pd.DataFrame) -> dict[str, float | str | None]:
+    """Extract the most recent zscore/hedge_ratio/regime from an analyzed dataframe.
+
+    Pure, no I/O — used to snapshot the signal context worth remembering
+    alongside a trade. Each field is ``None`` if the column is absent or
+    has no non-null value yet (e.g. still warming up), never raises.
+
+    Parameters
+    ----------
+    analyzed:
+        A dataframe as produced by ``populate_indicators``/
+        ``merge_indicators_into_dataframe``.
+
+    Returns
+    -------
+    dict[str, float | str | None]
+        Keys ``"zscore"``, ``"hedge_ratio"``, ``"regime"``.
+    """
+
+    def _latest(column: str) -> float | str | None:
+        if column not in analyzed.columns:
+            return None
+        values = analyzed[column].dropna()
+        return values.iloc[-1] if not values.empty else None
+
+    return {
+        "zscore": _latest("zscore"),
+        "hedge_ratio": _latest("hedge_ratio"),
+        "regime": _latest("regime"),
+    }
 
 
 def compute_pair_indicators(
@@ -564,6 +598,23 @@ class StatArbSwing(IStrategy):
             )
         )
 
+        # Per-pair signal context captured at entry (zscore/hedge_ratio/regime,
+        # plus entry price/time), held in memory until the trade closes and a
+        # single combined TradeRecord can be written. Process-local: a Hermes
+        # restart between entry and exit loses it, degrading those fields to
+        # None on the eventual record rather than losing the record itself.
+        self._pending_entry_context: dict[str, dict[str, Any]] = {}
+
+        self.memory_store: MemoryStore | None = None
+        try:
+            user_data_dir = Path(config.get("user_data_dir", "user_data"))
+            self.memory_store = MemoryStore(user_data_dir / "hermes_memory.sqlite3")
+        except Exception:
+            logger.exception(
+                "Failed to initialize Hermes memory store; trade history will not be "
+                "recorded (trading is unaffected)"
+            )
+
     def informative_pairs(self) -> list[tuple[str, str, str]]:
         """Both legs are already in the main whitelist; nothing extra needed."""
         return []
@@ -768,7 +819,51 @@ class StatArbSwing(IStrategy):
         )
         if not decision.allowed:
             logger.info("Blocking entry for %s: %s", pair, "; ".join(decision.reasons))
-        return decision.allowed
+            return False
+
+        try:
+            self._record_entry(pair, side, rate, current_time, analyzed)
+        except Exception:
+            logger.exception(
+                "Failed to record entry to Hermes memory for %s; trade proceeds", pair
+            )
+        return True
+
+    def _record_entry(
+        self,
+        pair: str,
+        side: str,
+        rate: float,
+        current_time: datetime,
+        analyzed: pd.DataFrame,
+    ) -> None:
+        """Snapshot entry-time signal context and, if available, log it to Hermes.
+
+        Never raises to its caller by design of the components it calls:
+        `latest_signal_context` is pure, and `MemoryStore.record_trade`
+        catches its own exceptions. The caller still wraps this call, as
+        defense in depth against a future change here.
+        """
+        context = latest_signal_context(analyzed)
+        self._pending_entry_context[pair] = {
+            **context,
+            "side": side,
+            "entry_price": rate,
+            "entry_time": current_time,
+        }
+        if self.memory_store is None:
+            return
+        self.memory_store.record_trade(
+            TradeRecord(
+                pair=pair,
+                side=side,
+                entry_time=current_time,
+                entry_price=rate,
+                entry_zscore=context["zscore"],
+                hedge_ratio=context["hedge_ratio"],
+                regime=context["regime"],
+            )
+        )
 
     def confirm_trade_exit(
         self,
@@ -802,4 +897,79 @@ class StatArbSwing(IStrategy):
                 "armed, but the exit itself is not blocked",
                 pair,
             )
+
+        try:
+            self._record_exit(pair, trade, rate, exit_reason, current_time)
+        except Exception:
+            logger.exception(
+                "Failed to record exit to Hermes memory for %s; exit proceeds", pair
+            )
+
         return True
+
+    def _record_exit(
+        self,
+        pair: str,
+        trade: Trade,
+        rate: float,
+        exit_reason: str,
+        current_time: datetime,
+    ) -> None:
+        """Combine the entry context captured in `_record_entry` with the closing
+        trade's P&L/fees into a single completed-trade record for Hermes.
+
+        Best-effort throughout: a missing entry context (e.g. Hermes
+        restarted mid-trade) or an un-computable P&L degrades individual
+        fields to `None` rather than skipping the record.
+        """
+        entry_context = self._pending_entry_context.pop(pair, {})
+
+        if self.memory_store is None:
+            return
+
+        try:
+            pnl = trade.calc_profit(rate)
+            pnl_pct = trade.calc_profit_ratio(rate)
+        except Exception:
+            logger.warning("Could not compute P&L for %s at exit; recording without it", pair)
+            pnl = None
+            pnl_pct = None
+
+        fee_components = [
+            fee for fee in (trade.fee_open_cost, trade.fee_close_cost) if fee is not None
+        ]
+        fees = sum(fee_components) if fee_components else None
+        funding = getattr(trade, "funding_fees", None)
+
+        entry_time = entry_context.get("entry_time") or trade.open_date_utc
+        holding_time_seconds = (
+            (current_time - entry_time).total_seconds() if entry_time is not None else None
+        )
+
+        exit_context: dict[str, float | str | None] = {}
+        dp = getattr(self, "dp", None)
+        if dp is not None:
+            exit_analyzed = dp.get_analyzed_dataframe(pair, self.timeframe)[0]
+            if exit_analyzed is not None and not exit_analyzed.empty:
+                exit_context = latest_signal_context(exit_analyzed)
+
+        self.memory_store.record_trade(
+            TradeRecord(
+                pair=pair,
+                side=entry_context.get("side"),
+                entry_time=entry_time,
+                exit_time=current_time,
+                entry_price=entry_context.get("entry_price", trade.open_rate),
+                exit_price=rate,
+                pnl=pnl,
+                pnl_pct=pnl_pct,
+                fees=fees,
+                funding=funding,
+                entry_zscore=entry_context.get("zscore"),
+                exit_zscore=exit_context.get("zscore"),
+                hedge_ratio=entry_context.get("hedge_ratio"),
+                holding_time_seconds=holding_time_seconds,
+                exit_reason=exit_reason,
+                regime=entry_context.get("regime"),
+            )
+        )

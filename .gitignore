@@ -23,6 +23,9 @@ user_data/freqaimodels/*
 !user_data/freqaimodels/.gitkeep
 user_data/notebooks/.ipynb_checkpoints/
 *.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 *.log
 
 # Editors / OS
