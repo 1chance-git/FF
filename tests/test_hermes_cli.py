@@ -164,7 +164,16 @@ def test_backtest_command_reports_success(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(BacktestLauncher, "run", fake_run)
 
     result = CliRunner().invoke(
-        cli, ["backtest", "-c", str(config_file), "--strategy", "StatArbSwing"]
+        cli,
+        [
+            "backtest",
+            "-c",
+            str(config_file),
+            "--strategy",
+            "StatArbSwing",
+            "--user-data-dir",
+            str(tmp_path),
+        ],
     )
 
     assert result.exit_code == 0
@@ -189,11 +198,55 @@ def test_backtest_command_reports_failure(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(BacktestLauncher, "run", fake_run)
 
     result = CliRunner().invoke(
-        cli, ["backtest", "-c", str(config_file), "--strategy", "StatArbSwing"]
+        cli,
+        [
+            "backtest",
+            "-c",
+            str(config_file),
+            "--strategy",
+            "StatArbSwing",
+            "--user-data-dir",
+            str(tmp_path),
+        ],
     )
 
     assert result.exit_code == 2
     assert "failed" in result.output.lower()
+
+
+def test_backtest_command_persists_result_via_memory_store(monkeypatch, tmp_path: Path) -> None:
+    config_file = tmp_path / "config.json"
+    config_file.write_text("{}")
+
+    def fake_run(self, config, timeout_seconds=None):
+        assert self.memory_store is not None
+        return BacktestResult(
+            command=("freqtrade", "backtesting"),
+            exit_code=0,
+            stdout="ok",
+            stderr="",
+            duration_seconds=1.23,
+        )
+
+    from hermes.backtest import BacktestLauncher
+
+    monkeypatch.setattr(BacktestLauncher, "run", fake_run)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "backtest",
+            "-c",
+            str(config_file),
+            "--strategy",
+            "StatArbSwing",
+            "--user-data-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert (tmp_path / "hermes_memory.sqlite3").exists()
 
 
 def test_verbose_and_json_log_file_options_accepted(tmp_path: Path) -> None:

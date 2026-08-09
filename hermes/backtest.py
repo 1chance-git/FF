@@ -30,6 +30,21 @@ Design decisions
   needs to see the stdout/stderr for, not an exceptional condition that
   should unwind the caller's stack. `BacktestResult.succeeded` lets a
   caller branch on outcome without needing a try/except.
+* **Persistence to Hermes memory is optional and strictly best-effort.**
+  `BacktestLauncher` takes an optional `hermes.memory.MemoryStore` and,
+  after every run, records the result via
+  `memory_store.record_backtest_result()` — but this never changes what
+  `run()` returns, and never raises: a database failure is logged as
+  `[HERMES][MEMORY][ERROR]` and otherwise ignored. This module's own
+  `BacktestResult` (the subprocess outcome: command/exit
+  code/stdout/stderr/duration) is distinct from
+  `hermes.memory.BacktestResult` (the persisted row: strategy/timerange/
+  a JSON `metrics` blob) — rather than growing the memory schema with
+  columns mirroring this one, the whole subprocess outcome plus the
+  config identifiers not already covered by `strategy`/`timerange`
+  (config files, timeframe, strategy path) are packed into `metrics`,
+  since `metrics` already exists precisely to hold run-shaped data that
+  varies by caller instead of forcing a schema migration per new field.
 """
 
 from __future__ import annotations
@@ -40,6 +55,9 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from hermes.memory import BacktestResult as MemoryBacktestResult
+from hermes.memory import MemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +173,18 @@ def build_backtest_command(config: BacktestConfig) -> list[str]:
 class BacktestLauncher:
     """Launches `freqtrade backtesting` as a subprocess and reports the outcome."""
 
+    def __init__(self, memory_store: MemoryStore | None = None) -> None:
+        """Initialize the launcher.
+
+        Parameters
+        ----------
+        memory_store:
+            Optional `hermes.memory.MemoryStore` to persist each
+            completed run's result to. Omit to run with no persistence
+            (e.g. existing callers, or tests that don't care about it).
+        """
+        self.memory_store = memory_store
+
     def run(self, config: BacktestConfig, timeout_seconds: float | None = None) -> BacktestResult:
         """Run a backtest and return its result.
 
@@ -210,4 +240,53 @@ class BacktestLauncher:
             logger.warning(
                 "Backtest exited with code %d after %.1fs", result.exit_code, duration
             )
+
+        self._record_result(config, result)
         return result
+
+    def _record_result(self, config: BacktestConfig, result: BacktestResult) -> None:
+        """Best-effort persistence of `result` to Hermes memory; never raises.
+
+        Persists the strategy and timerange as their own columns
+        (`hermes.memory.BacktestResult` already has them) and packs
+        everything else this launcher knows about the run — the
+        subprocess outcome plus the configuration identifiers not
+        already covered — into `metrics`, so a database failure or an
+        absent `memory_store` never affects the value `run()` returns.
+        """
+        if self.memory_store is None:
+            return
+
+        metrics = {
+            "exit_code": result.exit_code,
+            "succeeded": result.succeeded,
+            "duration_seconds": result.duration_seconds,
+            "command": list(result.command),
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "config_files": [str(path) for path in config.config_files],
+            "timeframe": config.timeframe,
+            "strategy_path": str(config.strategy_path) if config.strategy_path else None,
+            "extra_args": list(config.extra_args),
+        }
+
+        try:
+            recorded = self.memory_store.record_backtest_result(
+                MemoryBacktestResult(
+                    strategy=config.strategy,
+                    timerange=config.timerange,
+                    metrics=metrics,
+                )
+            )
+            if not recorded:
+                logger.error(
+                    "[HERMES][MEMORY][ERROR] Failed to persist backtest result "
+                    "(backtest result is unaffected)"
+                )
+        except Exception as exc:
+            logger.error(
+                "[HERMES][MEMORY][ERROR] Failed to persist backtest result "
+                "(backtest result is unaffected): %s",
+                exc,
+                exc_info=True,
+            )

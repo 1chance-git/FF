@@ -30,6 +30,7 @@ from rich.table import Table
 from hermes.backtest import BacktestConfig, BacktestLauncher
 from hermes.health import HealthChecker, HealthStatus
 from hermes.logging_config import LoggingConfig, configure_logging, get_logger
+from hermes.memory import MemoryStore
 from hermes.process import BotProcessManager, ProcessConfig
 
 logger = get_logger(__name__)
@@ -126,6 +127,12 @@ def health(api_url: str, username: str | None, password: str | None) -> None:
     "--strategy-path", default=None, type=click.Path(exists=True, path_type=Path)
 )
 @click.option("--timeout", default=None, type=float, help="Timeout in seconds.")
+@click.option(
+    "--user-data-dir",
+    default=Path("user_data"),
+    type=click.Path(path_type=Path),
+    help="Directory holding hermes_memory.sqlite3 (the same history trades are recorded to).",
+)
 def backtest(
     config_files: tuple[Path, ...],
     strategy: str,
@@ -133,6 +140,7 @@ def backtest(
     timeframe: str | None,
     strategy_path: Path | None,
     timeout: float | None,
+    user_data_dir: Path,
 ) -> None:
     """Launch a Freqtrade backtest and print a summary."""
     bt_config = BacktestConfig(
@@ -142,8 +150,18 @@ def backtest(
         timeframe=timeframe,
         strategy_path=strategy_path,
     )
+
+    memory_store = None
+    try:
+        memory_store = MemoryStore(user_data_dir / "hermes_memory.sqlite3")
+    except Exception:
+        logger.exception(
+            "[HERMES][MEMORY][ERROR] Failed to initialize Hermes memory store; "
+            "this backtest result will not be recorded"
+        )
+
     console.print(f"[bold]Launching backtest[/bold] for strategy [cyan]{strategy}[/cyan]...")
-    result = BacktestLauncher().run(bt_config, timeout_seconds=timeout)
+    result = BacktestLauncher(memory_store=memory_store).run(bt_config, timeout_seconds=timeout)
 
     if result.succeeded:
         console.print(
