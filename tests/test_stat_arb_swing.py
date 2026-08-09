@@ -889,6 +889,226 @@ def test_latest_signal_context_handles_all_nan_column(sas) -> None:
     assert context["zscore"] is None
 
 
+# ---------------------------------------------------------------------------
+# Hermes memory wiring: strategy error recording
+# ---------------------------------------------------------------------------
+
+
+class _ExplodingDataProvider:
+    """Raises on any analyzed-dataframe lookup, to trigger confirm_trade_entry's
+    outer fail-closed exception handler."""
+
+    def get_analyzed_dataframe(self, pair, timeframe):
+        raise RuntimeError("simulated dataprovider failure")
+
+
+def test_confirm_trade_entry_exception_is_persisted_with_pair_and_type(sas) -> None:
+    """Category 1 + 2: an existing (already fail-closed) exception is persisted,
+    and includes the pair plus the exception type/message."""
+    strategy = make_strategy(sas)
+    strategy.dp = _ExplodingDataProvider()
+
+    allowed = strategy.confirm_trade_entry(
+        pair=Y_PAIR,
+        order_type="limit",
+        amount=1.0,
+        rate=100.0,
+        time_in_force="GTC",
+        current_time=datetime.now(timezone.utc),
+        entry_tag=None,
+        side="long",
+    )
+
+    assert allowed is False  # existing fail-closed behavior preserved
+    [error] = strategy.memory_store.get_errors()
+    assert error.source == "confirm_trade_entry"
+    assert Y_PAIR in error.message
+    assert "RuntimeError" in error.message
+    assert "simulated dataprovider failure" in error.message
+    assert error.severity == "error"
+
+
+def test_populate_indicators_market_data_error_is_recorded_and_dataframe_unchanged(sas) -> None:
+    """Category 1 + 6: an indicator/calculation failure (MarketDataError) is
+    persisted, and populate_indicators still returns the dataframe unchanged --
+    the existing fail-safe/no-signal-change behavior is untouched."""
+    strategy = make_strategy(sas)
+    y_df, x_df = make_cointegrated_legs(n=50)
+    x_df_broken = x_df.copy()
+    x_df_broken.loc[0, "high"] = -1.0  # negative price -> MarketDataError
+    strategy.dp = SimpleNamespace(get_pair_dataframe=lambda pair, timeframe: x_df_broken)
+
+    y_df_input = y_df.copy()
+    result = strategy.populate_indicators(y_df_input, {"pair": Y_PAIR})
+
+    pd.testing.assert_frame_equal(result, y_df)  # unchanged, exactly as before this change
+    [error] = strategy.memory_store.get_errors()
+    assert error.source == "populate_indicators"
+    assert Y_PAIR in error.message
+    assert "MarketDataError" in error.message
+
+
+def test_confirm_trade_exit_risk_engine_failure_is_persisted_and_still_confirms(sas) -> None:
+    """Category 1 + 6: a trade-callback failure (risk_engine.record_exit raising)
+    is persisted, and confirm_trade_exit still returns True unchanged."""
+    strategy = make_strategy(sas)
+
+    def exploding_record_exit(*args, **kwargs):
+        raise RuntimeError("simulated risk engine failure")
+
+    strategy.risk_engine.record_exit = exploding_record_exit
+
+    result = strategy.confirm_trade_exit(
+        pair=Y_PAIR,
+        trade=SimpleNamespace(),
+        order_type="limit",
+        amount=1.0,
+        rate=95.0,
+        time_in_force="GTC",
+        exit_reason="stop_loss",
+        current_time=datetime.now(timezone.utc),
+    )
+
+    assert result is True  # existing behavior: exit is never blocked
+    errors = strategy.memory_store.get_errors()
+    assert any(e.source == "confirm_trade_exit" and Y_PAIR in e.message for e in errors)
+
+
+def test_record_strategy_error_handles_missing_pair_and_note(sas) -> None:
+    """Category 3: optional pair/note context is handled safely when absent."""
+    strategy = make_strategy(sas)
+
+    strategy._record_strategy_error("some_source", RuntimeError("boom"))
+
+    [error] = strategy.memory_store.get_errors()
+    assert error.source == "some_source"
+    assert error.message == "RuntimeError: boom"
+
+
+def test_record_strategy_error_is_a_noop_without_a_memory_store(sas) -> None:
+    """Category 3 (and part of 4): missing memory_store is handled safely, not as a crash."""
+    strategy = make_strategy(sas)
+    strategy.memory_store = None
+
+    strategy._record_strategy_error("some_source", RuntimeError("boom"), pair=Y_PAIR)  # must not raise
+
+
+def test_memory_failure_during_error_recording_does_not_change_fail_closed_behavior(sas) -> None:
+    """Category 4: if persisting the error *itself* fails, the original fail-safe
+    decision (blocked entry) must be completely unaffected."""
+    strategy = make_strategy(sas)
+    strategy.dp = _ExplodingDataProvider()
+
+    class ExplodingMemoryStore:
+        def record_error(self, *args, **kwargs):
+            raise RuntimeError("simulated disk failure")
+
+    strategy.memory_store = ExplodingMemoryStore()
+
+    allowed = strategy.confirm_trade_entry(
+        pair=Y_PAIR,
+        order_type="limit",
+        amount=1.0,
+        rate=100.0,
+        time_in_force="GTC",
+        current_time=datetime.now(timezone.utc),
+        entry_tag=None,
+        side="long",
+    )
+
+    assert allowed is False  # unchanged: still fails closed
+
+
+def test_memory_failure_during_error_recording_does_not_block_exit(sas) -> None:
+    """Category 4, exit side: a broken memory_store must not prevent confirm_trade_exit
+    from still confirming the exit, even while a trade-callback failure is also occurring."""
+    strategy = make_strategy(sas)
+
+    def exploding_record_exit(*args, **kwargs):
+        raise RuntimeError("simulated risk engine failure")
+
+    strategy.risk_engine.record_exit = exploding_record_exit
+
+    class ExplodingMemoryStore:
+        def record_error(self, *args, **kwargs):
+            raise RuntimeError("simulated disk failure")
+
+        def record_trade(self, *args, **kwargs):
+            raise RuntimeError("simulated disk failure")
+
+    strategy.memory_store = ExplodingMemoryStore()
+
+    result = strategy.confirm_trade_exit(
+        pair=Y_PAIR,
+        trade=FakeTrade(),
+        order_type="limit",
+        amount=1.0,
+        rate=95.0,
+        time_in_force="GTC",
+        exit_reason="stop_loss",
+        current_time=datetime.now(timezone.utc),
+    )
+
+    assert result is True  # unchanged: exit is never blocked
+
+
+def test_no_secrets_from_config_leak_into_persisted_errors(sas) -> None:
+    """Category 5: the persisted error message is built only from the exception's
+    type/message plus pair/note -- never from self.config, which may hold exchange
+    credentials (walletAddress/privateKey per user_data/config.json)."""
+    strategy = make_strategy(sas)
+    strategy.config = {
+        **strategy.config,
+        "exchange": {
+            "privateKey": "SECRET_KEY_ABC123",
+            "walletAddress": "0xSECRETADDRESS",
+        },
+    }
+    strategy.dp = _ExplodingDataProvider()
+
+    strategy.confirm_trade_entry(
+        pair=Y_PAIR,
+        order_type="limit",
+        amount=1.0,
+        rate=100.0,
+        time_in_force="GTC",
+        current_time=datetime.now(timezone.utc),
+        entry_tag=None,
+        side="long",
+    )
+
+    errors = strategy.memory_store.get_errors()
+    assert errors
+    for error in errors:
+        assert "SECRET_KEY_ABC123" not in error.message
+        assert "0xSECRETADDRESS" not in error.message
+
+
+def test_error_recording_does_not_change_behavior_with_or_without_memory_store(sas) -> None:
+    """Category 6: confirm_trade_entry's return value is identical whether or not
+    a memory_store is present -- error persistence is strictly additive."""
+    strategy_with_store = make_strategy(sas)
+    strategy_with_store.dp = _ExplodingDataProvider()
+
+    strategy_without_store = make_strategy(sas)
+    strategy_without_store.memory_store = None
+    strategy_without_store.dp = _ExplodingDataProvider()
+
+    kwargs = dict(
+        pair=Y_PAIR,
+        order_type="limit",
+        amount=1.0,
+        rate=100.0,
+        time_in_force="GTC",
+        current_time=datetime.now(timezone.utc),
+        entry_tag=None,
+        side="long",
+    )
+
+    assert strategy_with_store.confirm_trade_entry(**kwargs) is False
+    assert strategy_without_store.confirm_trade_entry(**kwargs) is False
+
+
 def test_strategy_resolves_via_freqtrade_strategy_resolver() -> None:
     """Confirm Freqtrade's own resolver (not just direct instantiation) can load it.
 

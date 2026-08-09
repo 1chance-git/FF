@@ -126,7 +126,7 @@ from stat_arb.risk.risk import (
     compute_stop_loss_price,
 )
 
-from hermes.memory import MemoryStore, TradeRecord
+from hermes.memory import ErrorEvent, MemoryStore, TradeRecord
 
 logger = logging.getLogger(__name__)
 
@@ -652,6 +652,9 @@ class StatArbSwing(IStrategy):
                 )
         except MarketDataError as exc:
             logger.warning("Could not align %s/%s data for %s: %s", self.Y_PAIR, self.X_PAIR, pair, exc)
+            self._record_strategy_error(
+                "populate_indicators", exc, pair=pair, note="market data alignment failure"
+            )
             return dataframe
 
         indicators = compute_pair_indicators(
@@ -772,11 +775,14 @@ class StatArbSwing(IStrategy):
             return self._confirm_trade_entry_unsafe(
                 pair=pair, rate=rate, current_time=current_time, side=side
             )
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "confirm_trade_entry raised an unexpected error for %s; blocking entry "
                 "(fail closed)",
                 pair,
+            )
+            self._record_strategy_error(
+                "confirm_trade_entry", exc, pair=pair, note="fail-closed risk-gate exception"
             )
             return False
 
@@ -823,11 +829,65 @@ class StatArbSwing(IStrategy):
 
         try:
             self._record_entry(pair, side, rate, current_time, analyzed)
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "Failed to record entry to Hermes memory for %s; trade proceeds", pair
             )
+            self._record_strategy_error(
+                "confirm_trade_entry", exc, pair=pair, note="entry memory-recording failure"
+            )
         return True
+
+    def _record_strategy_error(
+        self,
+        source: str,
+        exc: Exception,
+        *,
+        pair: str | None = None,
+        note: str | None = None,
+    ) -> None:
+        """Best-effort persistence of an already-handled strategy exception to Hermes memory.
+
+        Called from existing `except` blocks *after* they've already
+        decided the fail-safe outcome (blocked entry, unblocked exit,
+        unchanged dataframe, etc.) — this never influences that outcome
+        and is always a no-op if `self.memory_store` is `None`, so
+        memory is never a dependency trading relies on.
+
+        The persisted message is built only from `type(exc).__name__`,
+        `str(exc)`, `pair`, and `note` — never from `self.config`,
+        `kwargs`, or any other object that could carry exchange
+        credentials or secrets.
+
+        Logs `[HERMES][MEMORY][ERROR]` either way: once the underlying
+        exception was persisted (or an attempt was made), that's always
+        a "memory" log line worth the same tag, whether the write
+        itself succeeded or failed.
+        """
+        if self.memory_store is None:
+            return
+
+        message = f"{type(exc).__name__}: {exc}"
+        if pair is not None:
+            message = f"[{pair}] {message}"
+        if note:
+            message = f"{note}: {message}"
+
+        try:
+            recorded = self.memory_store.record_error(
+                ErrorEvent(source=source, message=message, severity="error")
+            )
+            if recorded:
+                logger.error("[HERMES][MEMORY][ERROR] %s", message)
+            else:
+                logger.error("[HERMES][MEMORY][ERROR] Failed to persist error: %s", message)
+        except Exception as persist_exc:  # noqa: BLE001 - persistence must never propagate
+            logger.error(
+                "[HERMES][MEMORY][ERROR] Failed to persist error (%s): %s",
+                message,
+                persist_exc,
+                exc_info=True,
+            )
 
     def _record_entry(
         self,
@@ -891,18 +951,24 @@ class StatArbSwing(IStrategy):
         stop_loss_triggered = exit_reason in ("stop_loss", "stoploss")
         try:
             self.risk_engine.record_exit(pair, current_time, stop_loss_triggered=stop_loss_triggered)
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "Failed to record exit with the risk engine for %s; cooldown may not be "
                 "armed, but the exit itself is not blocked",
                 pair,
             )
+            self._record_strategy_error(
+                "confirm_trade_exit", exc, pair=pair, note="cooldown bookkeeping failure"
+            )
 
         try:
             self._record_exit(pair, trade, rate, exit_reason, current_time)
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "Failed to record exit to Hermes memory for %s; exit proceeds", pair
+            )
+            self._record_strategy_error(
+                "confirm_trade_exit", exc, pair=pair, note="exit memory-recording failure"
             )
 
         return True
@@ -930,8 +996,11 @@ class StatArbSwing(IStrategy):
         try:
             pnl = trade.calc_profit(rate)
             pnl_pct = trade.calc_profit_ratio(rate)
-        except Exception:
+        except Exception as exc:
             logger.warning("Could not compute P&L for %s at exit; recording without it", pair)
+            self._record_strategy_error(
+                "confirm_trade_exit._record_exit", exc, pair=pair, note="P&L calculation failure"
+            )
             pnl = None
             pnl_pct = None
 
