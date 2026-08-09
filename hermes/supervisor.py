@@ -46,6 +46,15 @@ Design decisions
   process entrypoint calls once before `run()`; `request_stop()` itself
   has no such restriction and is what the installed handlers (or a
   test, or any other caller) actually invoke.
+* **Memory recording is optional and never allowed to affect supervision.**
+  `Supervisor` takes an optional `hermes.memory.MemoryStore` and records
+  start/crash/stop events (and a final error if restarts are exhausted)
+  to it — but `MemoryStore` is injected, not constructed here, so a
+  caller that doesn't want persistence can simply omit it, and every
+  recording call is wrapped so a database failure is logged and
+  swallowed rather than interrupting supervision (the same principle
+  `StatArbSwing.confirm_trade_entry`/`confirm_trade_exit` apply to
+  trade recording).
 """
 
 from __future__ import annotations
@@ -60,6 +69,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
+from hermes.memory import ErrorEvent, MemoryStore, ProcessEvent
 from hermes.process import ProcessConfig, ProcessError, build_trade_command
 
 logger = logging.getLogger(__name__)
@@ -151,6 +161,7 @@ class Supervisor:
         config: SupervisorConfig,
         command_builder: Callable[[ProcessConfig], list[str]] = build_trade_command,
         sleep: Callable[[float], None] = time.sleep,
+        memory_store: MemoryStore | None = None,
     ) -> None:
         """Initialize the supervisor.
 
@@ -165,10 +176,15 @@ class Supervisor:
         sleep:
             Sleep function, overridable in tests so restart backoff
             doesn't block real time.
+        memory_store:
+            Optional `hermes.memory.MemoryStore` to record start/crash/
+            stop events to, alongside the structured log lines. Omit to
+            run with logging only.
         """
         self.config = config
         self._command_builder = command_builder
         self._sleep = sleep
+        self.memory_store = memory_store
         self._stop_requested = threading.Event()
         self._process: subprocess.Popen | None = None
 
@@ -193,6 +209,7 @@ class Supervisor:
 
             if self._stop_requested.is_set():
                 _log(TAG_STOP, f"Bot exited (pid={self._process.pid}, code={exit_code})")
+                self._remember_event(TAG_STOP.lower(), pid=self._process.pid, message=f"exit code {exit_code}")
                 return
 
             _log(
@@ -200,6 +217,7 @@ class Supervisor:
                 f"Bot exited unexpectedly (pid={self._process.pid}, code={exit_code})",
                 level=logging.ERROR,
             )
+            self._remember_event(TAG_CRASH.lower(), pid=self._process.pid, message=f"exit code {exit_code}")
             self._restart_with_backoff()
 
     def request_stop(self) -> None:
@@ -212,6 +230,28 @@ class Supervisor:
             self._process.terminate()
 
     # -- internals ---------------------------------------------------
+
+    def _remember_event(self, event_type: str, *, pid: int | None = None, message: str | None = None) -> None:
+        """Best-effort record of a process event; never raises."""
+        if self.memory_store is None:
+            return
+        try:
+            self.memory_store.record_process_event(
+                ProcessEvent(event_type=event_type, pid=pid, message=message)
+            )
+        except Exception:
+            logger.exception("Failed to record %s event to Hermes memory (supervision unaffected)", event_type)
+
+    def _remember_error(self, message: str) -> None:
+        """Best-effort record of a fatal supervisor error; never raises."""
+        if self.memory_store is None:
+            return
+        try:
+            self.memory_store.record_error(
+                ErrorEvent(source="hermes.supervisor", message=message, severity="critical")
+            )
+        except Exception:
+            logger.exception("Failed to record error to Hermes memory (supervision unaffected)")
 
     def _start(self) -> None:
         command = self._command_builder(self.config.process_config)
@@ -230,6 +270,7 @@ class Supervisor:
         self._process = process
         self._start_output_threads(process)
         _log(TAG_START, f"Bot started (pid={process.pid})")
+        self._remember_event(TAG_START.lower(), pid=process.pid)
 
     def _start_output_threads(self, process: subprocess.Popen) -> None:
         threading.Thread(
@@ -287,6 +328,7 @@ class Supervisor:
 
             if self._stop_requested.is_set():
                 _log(TAG_STOP, f"Bot exited (pid={self._process.pid}, code={exit_code})")
+                self._remember_event(TAG_STOP.lower(), pid=self._process.pid, message=f"exit code {exit_code}")
                 return
 
             _log(
@@ -294,8 +336,11 @@ class Supervisor:
                 f"Restart attempt {attempt} crashed again (pid={self._process.pid}, code={exit_code})",
                 level=logging.ERROR,
             )
+            self._remember_event(TAG_CRASH.lower(), pid=self._process.pid, message=f"exit code {exit_code}")
 
-        raise ProcessError(f"Bot failed to restart after {self.config.max_restarts} attempts")
+        message = f"Bot failed to restart after {self.config.max_restarts} attempts"
+        self._remember_error(message)
+        raise ProcessError(message)
 
 
 def install_signal_handlers(supervisor: Supervisor) -> None:
@@ -322,6 +367,7 @@ if __name__ == "__main__":
     parser.add_argument("--strategy", required=True)
     parser.add_argument("--strategy-path", default=None)
     parser.add_argument("--pid-file", default="user_data/hermes_supervisor.pid")
+    parser.add_argument("--user-data-dir", default="user_data")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -332,6 +378,15 @@ if __name__ == "__main__":
         pid_file=Path(args.pid_file),
         strategy_path=Path(args.strategy_path) if args.strategy_path else None,
     )
-    supervisor = Supervisor(SupervisorConfig(process_config=process_config))
+
+    memory_store = None
+    try:
+        memory_store = MemoryStore(Path(args.user_data_dir) / "hermes_memory.sqlite3")
+    except Exception:
+        logger.exception(
+            "Failed to initialize Hermes memory store; process events will not be recorded"
+        )
+
+    supervisor = Supervisor(SupervisorConfig(process_config=process_config), memory_store=memory_store)
     install_signal_handlers(supervisor)
     supervisor.run()

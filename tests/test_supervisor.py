@@ -20,6 +20,7 @@ import pytest
 
 pytestmark = pytest.mark.unit
 
+from hermes.memory import MemoryStore
 from hermes.process import ProcessConfig, ProcessError
 from hermes.supervisor import (
     Supervisor,
@@ -267,3 +268,104 @@ def test_install_signal_handlers_triggers_request_stop(
         assert supervisor._stop_requested.is_set()
     finally:
         signal.signal(signal.SIGTERM, previous_term)
+
+
+# -- memory wiring -------------------------------------------------------
+
+
+def test_start_and_graceful_stop_are_recorded_to_memory(tmp_path: Path) -> None:
+    memory_store = MemoryStore(tmp_path / "memory.sqlite3")
+    config = _fast_config(tmp_path)
+    supervisor = Supervisor(config, command_builder=lambda _: SLEEP_LONG, memory_store=memory_store)
+
+    thread = _run_in_thread(supervisor)
+    time.sleep(0.1)
+    supervisor.request_stop()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    events = memory_store.get_process_events()
+    event_types = [e.event_type for e in events]
+    assert event_types == ["start", "stop"]
+    assert events[0].pid is not None
+
+
+def test_crash_and_restart_are_recorded_to_memory(tmp_path: Path) -> None:
+    memory_store = MemoryStore(tmp_path / "memory.sqlite3")
+    config = _fast_config(tmp_path, health_interval_seconds=0.2, max_restarts=3)
+
+    calls = {"count": 0}
+
+    def command_builder(_config: ProcessConfig) -> list[str]:
+        calls["count"] += 1
+        return EXIT_IMMEDIATELY if calls["count"] == 1 else SLEEP_LONG
+
+    supervisor = Supervisor(
+        config, command_builder=command_builder, sleep=lambda _: None, memory_store=memory_store
+    )
+
+    thread = _run_in_thread(supervisor)
+    time.sleep(0.4)
+    supervisor.request_stop()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    event_types = [e.event_type for e in memory_store.get_process_events()]
+    assert event_types == ["start", "crash", "start", "stop"]
+
+
+def test_restarts_exhausted_records_a_critical_error(tmp_path: Path) -> None:
+    memory_store = MemoryStore(tmp_path / "memory.sqlite3")
+    config = _fast_config(tmp_path, health_interval_seconds=0.2, max_restarts=2)
+    supervisor = Supervisor(
+        config,
+        command_builder=lambda _: EXIT_IMMEDIATELY,
+        sleep=lambda _: None,
+        memory_store=memory_store,
+    )
+
+    with pytest.raises(ProcessError):
+        supervisor.run()
+
+    [error] = memory_store.get_errors()
+    assert error.source == "hermes.supervisor"
+    assert error.severity == "critical"
+    assert "failed to restart" in error.message
+
+
+def test_no_memory_store_is_a_safe_default(tmp_path: Path) -> None:
+    config = _fast_config(tmp_path)
+    supervisor = Supervisor(config, command_builder=lambda _: SLEEP_LONG)  # memory_store omitted
+
+    thread = _run_in_thread(supervisor)
+    time.sleep(0.1)
+    supervisor.request_stop()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()  # must not raise for lacking a memory_store
+
+
+def test_broken_memory_store_does_not_interrupt_supervision(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.ERROR, logger="hermes.supervisor")
+
+    class ExplodingMemoryStore:
+        def record_process_event(self, *args, **kwargs):
+            raise RuntimeError("simulated disk failure")
+
+        def record_error(self, *args, **kwargs):
+            raise RuntimeError("simulated disk failure")
+
+    config = _fast_config(tmp_path)
+    supervisor = Supervisor(
+        config, command_builder=lambda _: SLEEP_LONG, memory_store=ExplodingMemoryStore()
+    )
+
+    thread = _run_in_thread(supervisor)
+    time.sleep(0.1)
+    supervisor.request_stop()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert "Failed to record start event" in caplog.text
