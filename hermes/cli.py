@@ -14,6 +14,8 @@ Commands
 --------
 * ``hermes health`` — run health checks against a running bot's API.
 * ``hermes backtest`` — launch a backtest via :mod:`hermes.backtest`.
+* ``hermes analyze`` — read-only report over recorded trade history via
+  :mod:`hermes.analyzer`.
 * ``hermes start`` / ``stop`` / ``restart`` / ``status`` — process
   lifecycle via :mod:`hermes.process`.
 """
@@ -27,6 +29,8 @@ import click
 from rich.console import Console
 from rich.table import Table
 
+from hermes.analyzer import AnalysisReport
+from hermes.analyzer import analyze as analyze_history
 from hermes.backtest import BacktestConfig, BacktestLauncher
 from hermes.health import HealthChecker, HealthStatus
 from hermes.logging_config import LoggingConfig, configure_logging, get_logger
@@ -174,6 +178,113 @@ def backtest(
         )
         console.print(result.stderr[-2000:])
     sys.exit(result.exit_code)
+
+
+def render_analysis_report(report: AnalysisReport) -> str:
+    """Format an `AnalysisReport` as the plain-text report `hermes analyze` prints.
+
+    Pure formatting only — every number comes straight from `report`,
+    which itself only *reads* history (see `hermes.analyzer.analyze`);
+    this function computes nothing and touches no database. Kept
+    outside `hermes.analyzer` so that module stays untouched by this
+    command's presentation choices (e.g. rendering findings with the
+    tag on its own line, unlike `Finding.render()`'s single-line form).
+
+    Note on units: `EXPECTANCY` and `MAX DRAWDOWN` are shown in the
+    account's stake currency (e.g. USDC), not as a percentage — that's
+    how `hermes.analyzer` computes them (see its docstrings). Only
+    `WIN RATE` is a genuine percentage.
+    """
+    lines = ["[HERMES][ANALYSIS]", ""]
+    lines.append(f"TRADES: {report.trade_count}")
+    lines.append(f"WIN RATE: {report.win_rate * 100:.1f}%")
+    lines.append(f"EXPECTANCY: {report.expectancy:+.2f}")
+    lines.append(f"MAX DRAWDOWN: {report.max_drawdown:.2f}")
+    lines.append("")
+
+    if report.findings:
+        for finding in report.findings:
+            lines.append("[OBSERVATION]")
+            lines.append(finding.observation)
+            lines.append("")
+            if finding.hypothesis:
+                lines.append("[HYPOTHESIS]")
+                lines.append(finding.hypothesis)
+                lines.append("")
+    else:
+        lines.append("No notable patterns identified yet.")
+        lines.append("")
+
+    lines.append("STATUS: OBSERVATION ONLY")
+    return "\n".join(lines)
+
+
+_INSUFFICIENT_DATA_MESSAGE = (
+    "[HERMES][ANALYSIS]\nInsufficient historical data for meaningful analysis."
+)
+
+
+def _project_directory_not_detected_message(user_data_dir: Path) -> str:
+    return (
+        "[HERMES][ERROR]\n"
+        "Hermes project directory not detected.\n\n"
+        f'Could not find a "{user_data_dir}" folder here.\n'
+        "Run this command from the project's root folder (the one that\n"
+        "contains the user_data folder). For example:\n\n"
+        "    cd path/to/FF\n"
+        "    python -m hermes analyze"
+    )
+
+
+def _database_unreadable_message(db_path: Path) -> str:
+    return (
+        "[HERMES][ERROR]\n"
+        "Could not read the Hermes trading history database.\n\n"
+        f"The file at {db_path} may be corrupted or in an unexpected format.\n"
+        "If this keeps happening, rename or delete that file and Hermes will\n"
+        "start a fresh one the next time a trade, backtest, or restart is recorded."
+    )
+
+
+@cli.command()
+@click.option(
+    "--user-data-dir",
+    default=Path("user_data"),
+    type=click.Path(path_type=Path),
+    help="Directory holding hermes_memory.sqlite3 (the same history trades are recorded to).",
+)
+def analyze(user_data_dir: Path) -> None:
+    """Analyze recorded trade history and print a plain-language report.
+
+    Read-only: this command only reads from the existing Hermes SQLite
+    history (`hermes.memory.MemoryStore`) and runs the existing
+    analyzer (`hermes.analyzer.analyze`). It never writes to that
+    history, never changes strategy parameters or trading decisions,
+    and never deploys, optimizes, or retrains anything.
+    """
+    if not user_data_dir.is_dir():
+        click.echo(_project_directory_not_detected_message(user_data_dir))
+        sys.exit(1)
+
+    db_path = user_data_dir / "hermes_memory.sqlite3"
+    try:
+        store = MemoryStore(db_path)
+    except Exception as exc:
+        # A single log line, not a full traceback: this is an expected,
+        # handled outcome the user gets a plain-language message for
+        # below, not an unhandled crash worth alarming a terminal
+        # beginner with a stack trace.
+        logger.error("[HERMES][MEMORY][ERROR] Failed to open Hermes memory database at %s: %s", db_path, exc)
+        click.echo(_database_unreadable_message(db_path))
+        sys.exit(1)
+
+    report = analyze_history(store)
+
+    if report.trade_count == 0:
+        click.echo(_INSUFFICIENT_DATA_MESSAGE)
+        return
+
+    click.echo(render_analysis_report(report))
 
 
 def _process_manager(config_files: tuple[Path, ...], strategy: str, pid_file: Path) -> BotProcessManager:
