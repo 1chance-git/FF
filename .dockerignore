@@ -1,0 +1,37 @@
+# Local dev / build artifacts -- never useful inside the image.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.git/
+.github/
+
+# Runtime state that must come from a Railway Volume at deploy time, not
+# be baked into the image (see RAILWAY.md): downloaded candle data,
+# logs, backtest/hyperopt output, and Hermes' own SQLite history.
+user_data/data/*
+!user_data/data/.gitkeep
+user_data/logs/*
+!user_data/logs/.gitkeep
+user_data/backtest_results/*
+!user_data/backtest_results/.gitkeep
+user_data/hyperopt_results/*
+!user_data/hyperopt_results/.gitkeep
+user_data/freqaimodels/*
+!user_data/freqaimodels/.gitkeep
+user_data/notebooks/
+user_data/plot/
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.log
+
+# Secrets: never present in the repo, but excluded explicitly too --
+# defense in depth against this ever changing.
+user_data/config-private.json
+
+.vscode/
+.idea/
+.DS_Store
