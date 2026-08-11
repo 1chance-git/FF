@@ -107,8 +107,17 @@ added here, per "do not implement these yet unless they already exist."
    this, downloaded candle data and Hermes' trade/backtest history
    would be wiped on every redeploy — a Volume is what makes runs
    reproducible and lets Hermes memory accumulate across them.
-3. **Set the start command per run**, overriding the safe default in
-   `railway.json`. The first reproducible job — reusing exactly the
+3. **Set the start command per run**, via the service's Settings →
+   Deploy → Start Command in the Railway dashboard (or the equivalent
+   API/MCP call). `railway.json` intentionally does **not** set a
+   `deploy.startCommand` — Railway's own docs are explicit that a
+   config-as-code file's settings always override dashboard/API
+   settings for the same field, so if `railway.json` pinned a command,
+   no dashboard or API change could ever take effect without editing
+   and redeploying the file itself. Leaving it unset there is what
+   makes "set it per run" actually true. The Dockerfile's own `CMD`
+   (`hermes --help`) is still the safe fallback if no start command is
+   set anywhere. The first reproducible job — reusing exactly the
    `hermes backtest` path already built and tested — is:
 
    ```
