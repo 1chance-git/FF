@@ -10,12 +10,14 @@ why this exists: Freqtrade's own ``download-data`` command does not
 support Hyperliquid, even though Hyperliquid itself is reachable and
 returns valid candle history).
 
-Scope, deliberately narrow (see RAILWAY.md and the module docstring
-below for why): BTC only, 5m only. Nothing here assumes it generalizes
-to other coins/intervals yet -- ``interval_to_ms`` supports the other
-Hyperliquid interval strings already so a future widening doesn't need
-a rewrite, but no calling code in this module requests anything but
-BTC/5m.
+Originally proved narrowly (BTC, 5m only); generalized to cover
+BTC/ETH/SOL across 5m/1h/4h/1d once that single-pair/single-timeframe
+proof succeeded end-to-end on Railway against live Hyperliquid data
+(see RAILWAY.md). The per-request logic (pagination, dedup, validation,
+Freqtrade format/read-back) is unchanged from the proven version --
+``run_pipeline`` still handles exactly one (coin, interval) pair per
+call; ``run_pipeline_matrix`` is the only new piece, and it just calls
+``run_pipeline`` once per (coin, interval) combination.
 
 This module is never imported by ``StatArbSwing``, ``hermes``, or any
 live-trading path. Running it as a script only ever performs read-only
@@ -55,6 +57,18 @@ _INTERVAL_MS = {
     "1h": 60 * 60_000,
     "4h": 4 * 60 * 60_000,
     "1d": 24 * 60 * 60_000,
+}
+
+# The generalized scope, proven one (coin, interval) pair at a time via
+# run_pipeline before being run as this full matrix (see RAILWAY.md's
+# OHLCV audit, which already confirmed all 12 combinations return valid
+# candle history from Hyperliquid's native API).
+COINS = ["BTC", "ETH", "SOL"]
+INTERVALS = ["5m", "1h", "4h", "1d"]
+PAIR_FOR_COIN = {
+    "BTC": "BTC/USDC:USDC",
+    "ETH": "ETH/USDC:USDC",
+    "SOL": "SOL/USDC:USDC",
 }
 
 
@@ -434,36 +448,64 @@ def run_pipeline(
     )
 
 
-def _main() -> None:
-    """Small, controlled proof run: BTC, 5m, ~65 minutes of history,
-    fetched in 25-minute pages (forcing real pagination across ~3
-    requests) -- not years of data, per the task's explicit constraint.
+def default_window_for(coin: str, interval: str, *, candles_per_page: int = 5, total_candles: int = 13) -> tuple[int, int, int]:
+    """Compute (start_ms, end_ms, request_window_ms) for a small,
+    interval-scaled proof window: ``total_candles`` candles' worth of
+    history, fetched ``candles_per_page`` at a time (so pagination is
+    genuinely exercised at every interval, not just 5m). Scales with
+    the interval so 1d doesn't request 13 days when 13 5m-candles is
+    the intended proportion -- e.g. for "5m" this reproduces exactly
+    the originally-proven 65-minute/25-minute-page window.
     """
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-
+    interval_ms = interval_to_ms(interval)
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    start_ms = now_ms - 65 * 60_000
     end_ms = now_ms
+    start_ms = now_ms - total_candles * interval_ms
+    request_window_ms = candles_per_page * interval_ms
+    return start_ms, end_ms, request_window_ms
 
-    coin = "BTC"
-    interval = "5m"
-    pair = "BTC/USDC:USDC"
-    datadir = Path("user_data/data/hyperliquid")
 
-    print(f"[HL-PIPELINE] fetching {coin} {interval} {start_ms} -> {end_ms} (paginated, 25min windows)")
-    result = run_pipeline(
-        coin=coin,
-        interval=interval,
-        start_ms=start_ms,
-        end_ms=end_ms,
-        pair=pair,
-        datadir=datadir,
-        request_window_ms=25 * 60_000,
-    )
+def run_pipeline_matrix(
+    *,
+    coins: list[str] = COINS,
+    intervals: list[str] = INTERVALS,
+    pair_for_coin: dict[str, str] = PAIR_FOR_COIN,
+    datadir: Path,
+    candles_per_page: int = 5,
+    total_candles: int = 13,
+    candle_type: str = "futures",
+    fetch: FetchFn = fetch_candle_snapshot,
+) -> dict[tuple[str, str], PipelineResult]:
+    """Run ``run_pipeline`` once per (coin, interval) combination in the
+    matrix, each with its own interval-scaled small window (see
+    ``default_window_for``). Same per-pair logic as the original
+    single-pair proof -- this only adds the loop and result collection.
+    """
+    results: dict[tuple[str, str], PipelineResult] = {}
+    for coin in coins:
+        pair = pair_for_coin[coin]
+        for interval in intervals:
+            start_ms, end_ms, request_window_ms = default_window_for(
+                coin, interval, candles_per_page=candles_per_page, total_candles=total_candles
+            )
+            results[(coin, interval)] = run_pipeline(
+                coin=coin,
+                interval=interval,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                pair=pair,
+                datadir=datadir,
+                request_window_ms=request_window_ms,
+                candle_type=candle_type,
+                fetch=fetch,
+            )
+    return results
 
-    print("[HYPERLIQUID][DATA PIPELINE]")
+
+def _print_result(coin: str, interval: str, result: PipelineResult) -> None:
+    print(f"--- {coin} {interval} ---")
     print(f"API: {'PASS' if result.api_ok else 'FAIL'}")
-    print(f"BTC 5m download: {'PASS' if result.download_ok else 'FAIL'}")
+    print(f"{coin} {interval} download: {'PASS' if result.download_ok else 'FAIL'}")
     print(f"Pagination: {'PASS' if result.pagination_requests > 1 else 'FAIL'} ({result.pagination_requests} requests)")
     print(f"Deduplication: PASS ({result.dedup_removed} duplicate candle(s) removed)")
     print(f"OHLCV validation: {'PASS' if result.validation.ok else 'FAIL'}")
@@ -472,10 +514,37 @@ def _main() -> None:
             print(f"  - {issue}")
     print(f"Freqtrade format: {'PASS' if result.freqtrade_format_ok else 'FAIL'}")
     print(f"Freqtrade read-back: {'PASS' if result.freqtrade_readback_ok else 'FAIL'}")
-    print("")
     print(f"CANDLES: {result.candle_count}")
     print(f"DATE RANGE: {result.first_date} -> {result.last_date}")
     print(f"OUTPUT: {result.output_path}")
+    print("")
+
+
+def _main() -> None:
+    """Small, controlled proof run across the full BTC/ETH/SOL x
+    5m/1h/4h/1d matrix: 13 candles' worth of history per (coin,
+    interval), fetched 5 candles per page (forcing real pagination at
+    every interval) -- not years of data, per the task's explicit
+    constraint. For "5m" this is exactly the originally-proven
+    65-minute/25-minute-page window; other intervals scale the same
+    proportion.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    datadir = Path("user_data/data/hyperliquid")
+    print(f"[HL-PIPELINE] running matrix: coins={COINS} intervals={INTERVALS}")
+    results = run_pipeline_matrix(datadir=datadir)
+
+    print("[HYPERLIQUID][DATA PIPELINE]")
+    for coin in COINS:
+        for interval in INTERVALS:
+            _print_result(coin, interval, results[(coin, interval)])
+
+    all_pass = all(
+        r.api_ok and r.download_ok and r.validation.ok and r.freqtrade_format_ok and r.freqtrade_readback_ok
+        for r in results.values()
+    )
+    print(f"MATRIX RESULT: {'PASS' if all_pass else 'FAIL'} ({len(results)} combinations)")
 
 
 if __name__ == "__main__":
