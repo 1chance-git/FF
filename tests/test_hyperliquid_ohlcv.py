@@ -14,12 +14,17 @@ import pandas as pd
 import pytest
 
 from research.hyperliquid_ohlcv import (
+    COINS,
+    INTERVALS,
+    PAIR_FOR_COIN,
     HyperliquidAPIError,
     dedupe_and_sort,
+    default_window_for,
     fetch_candle_snapshot,
     interval_to_ms,
     paginate_candles,
     paginate_raw,
+    run_pipeline_matrix,
     to_dataframe,
     validate_ohlcv,
 )
@@ -253,3 +258,104 @@ class TestPaginationBoundaryHandling:
     def test_non_positive_window_raises(self):
         with pytest.raises(ValueError, match="must be positive"):
             paginate_raw("BTC", "5m", 0, 1000, request_window_ms=0, fetch=MagicMock())
+
+
+def _synthetic_fetch(coin, interval, start_ms, end_ms):
+    """Generic fake ``fetch`` usable for any coin/interval: generates a
+    real interval-spaced candle series covering [start_ms, end_ms]
+    inclusive, matching Hyperliquid's real inclusive-boundary behavior
+    (observed in the manual OHLCV audit, see RAILWAY.md)."""
+    step = interval_to_ms(interval)
+    first = ((start_ms + step - 1) // step) * step  # first grid point >= start_ms
+    timestamps = []
+    t = first
+    while t <= end_ms:
+        timestamps.append(t)
+        t += step
+    return [make_candle(t, step) for t in timestamps]
+
+
+class TestDefaultWindowFor:
+    def test_scales_with_interval(self):
+        for interval in INTERVALS:
+            start_ms, end_ms, request_window_ms = default_window_for("BTC", interval)
+            step = interval_to_ms(interval)
+            assert end_ms - start_ms == 13 * step
+            assert request_window_ms == 5 * step
+            assert start_ms < end_ms
+
+    def test_custom_candles_per_page_and_total(self):
+        start_ms, end_ms, request_window_ms = default_window_for(
+            "BTC", "1h", candles_per_page=2, total_candles=6
+        )
+        step = interval_to_ms("1h")
+        assert end_ms - start_ms == 6 * step
+        assert request_window_ms == 2 * step
+
+
+class TestMatrixConstants:
+    def test_all_coins_have_a_pair_mapping(self):
+        for coin in COINS:
+            assert coin in PAIR_FOR_COIN
+            assert "/" in PAIR_FOR_COIN[coin]
+
+    def test_expected_scope(self):
+        assert set(COINS) == {"BTC", "ETH", "SOL"}
+        assert set(INTERVALS) == {"5m", "1h", "4h", "1d"}
+
+
+class TestRunPipelineMatrix:
+    def test_runs_every_combination(self, tmp_path):
+        results = run_pipeline_matrix(
+            coins=["BTC", "ETH"],
+            intervals=["5m", "1h"],
+            pair_for_coin={"BTC": "BTC/USDC:USDC", "ETH": "ETH/USDC:USDC"},
+            datadir=tmp_path,
+            fetch=_synthetic_fetch,
+        )
+        assert set(results.keys()) == {("BTC", "5m"), ("BTC", "1h"), ("ETH", "5m"), ("ETH", "1h")}
+
+    def test_every_combination_passes_with_clean_synthetic_data(self, tmp_path):
+        results = run_pipeline_matrix(
+            coins=["BTC", "ETH", "SOL"],
+            intervals=["5m", "1h", "4h", "1d"],
+            pair_for_coin=PAIR_FOR_COIN,
+            datadir=tmp_path,
+            fetch=_synthetic_fetch,
+        )
+        assert len(results) == 12
+        for (coin, interval), result in results.items():
+            assert result.api_ok, f"{coin} {interval}: API call failed"
+            assert result.download_ok, f"{coin} {interval}: no candles downloaded"
+            assert result.validation.ok, f"{coin} {interval}: validation failed: {result.validation.issues}"
+            assert result.freqtrade_format_ok, f"{coin} {interval}: Freqtrade write failed"
+            assert result.freqtrade_readback_ok, f"{coin} {interval}: Freqtrade read-back failed"
+
+    def test_each_pair_writes_to_a_distinct_file(self, tmp_path):
+        results = run_pipeline_matrix(
+            coins=["BTC", "ETH"],
+            intervals=["5m", "1h"],
+            pair_for_coin={"BTC": "BTC/USDC:USDC", "ETH": "ETH/USDC:USDC"},
+            datadir=tmp_path,
+            fetch=_synthetic_fetch,
+        )
+        output_paths = {result.output_path for result in results.values()}
+        assert len(output_paths) == 4  # no accidental filename collisions across coins/intervals
+
+    def test_malformed_response_fails_only_that_combination(self, tmp_path):
+        def flaky_fetch(coin, interval, start_ms, end_ms):
+            if coin == "ETH" and interval == "1h":
+                raise HyperliquidAPIError("simulated exchange error")
+            return _synthetic_fetch(coin, interval, start_ms, end_ms)
+
+        results = run_pipeline_matrix(
+            coins=["BTC", "ETH"],
+            intervals=["5m", "1h"],
+            pair_for_coin={"BTC": "BTC/USDC:USDC", "ETH": "ETH/USDC:USDC"},
+            datadir=tmp_path,
+            fetch=flaky_fetch,
+        )
+        assert results[("ETH", "1h")].api_ok is False
+        assert results[("BTC", "5m")].api_ok is True
+        assert results[("BTC", "1h")].api_ok is True
+        assert results[("ETH", "5m")].api_ok is True
