@@ -28,10 +28,17 @@ COPY . .
 # (see README.md) -- no separate packaging step to keep in sync.
 RUN pip install --no-cache-dir -e .
 
-# Runs as a non-root user; a batch/backtest worker has no reason to run
-# as root, and this container never needs to bind a privileged port.
+# Creates the non-root user the process actually runs as; a batch/backtest
+# worker has no reason to run as root, and this container never needs to
+# bind a privileged port. The image itself stays on root as the container's
+# entry user (see ENTRYPOINT below) solely so it can fix ownership of the
+# Railway Volume mounted at /app/user_data/data -- which is created empty
+# and root-owned -- before dropping to `hermes` to run the real command.
 RUN useradd --create-home --uid 1000 hermes && chown -R hermes:hermes /app
-USER hermes
+
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 
 # Inert by default: prints Hermes' own CLI help and exits 0. The actual
 # research command (e.g. `hermes backtest ...` or `hermes analyze`) is
