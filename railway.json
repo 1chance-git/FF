@@ -5,7 +5,6 @@
     "dockerfilePath": "Dockerfile"
   },
   "deploy": {
-    "startCommand": "python -m hermes --help",
     "restartPolicyType": "NEVER",
     "numReplicas": 1
   }
