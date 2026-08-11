@@ -13,6 +13,7 @@ each individual `stat_arb` module that feeds it.
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -163,7 +164,7 @@ def test_full_pipeline_has_no_lookahead_bias() -> None:
     sas = _load_strategy_module()
     y_ohlcv, x_ohlcv = make_oscillating_cointegrated_pair(n=400)
 
-    strategy_baseline = sas.StatArbSwing({"stake_currency": "USDC", "runmode": None})
+    strategy_baseline = sas.StatArbSwing({"stake_currency": "USDC", "runmode": None, "user_data_dir": tempfile.mkdtemp(prefix="hermes_test_")})
     baseline = _run_full_pipeline(strategy_baseline, y_ohlcv, x_ohlcv)
 
     shocked_y = y_ohlcv.copy()
@@ -172,7 +173,7 @@ def test_full_pipeline_has_no_lookahead_bias() -> None:
     shocked_y.loc[shocked_y.index[-5:], "low"] += 500.0
     shocked_y.loc[shocked_y.index[-5:], "open"] += 500.0
 
-    strategy_shocked = sas.StatArbSwing({"stake_currency": "USDC", "runmode": None})
+    strategy_shocked = sas.StatArbSwing({"stake_currency": "USDC", "runmode": None, "user_data_dir": tempfile.mkdtemp(prefix="hermes_test_")})
     shocked = _run_full_pipeline(strategy_shocked, shocked_y, x_ohlcv)
 
     unaffected_columns = ["zscore", "enter_long", "enter_short", "exit_long", "exit_short"]
@@ -198,7 +199,7 @@ def test_full_pipeline_never_enters_both_directions_on_the_same_candle() -> None
     """
     sas = _load_strategy_module()
     y_ohlcv, x_ohlcv = make_oscillating_cointegrated_pair(n=400)
-    strategy = sas.StatArbSwing({"stake_currency": "USDC", "runmode": None})
+    strategy = sas.StatArbSwing({"stake_currency": "USDC", "runmode": None, "user_data_dir": tempfile.mkdtemp(prefix="hermes_test_")})
 
     df = _run_full_pipeline(strategy, y_ohlcv, x_ohlcv)
 
@@ -209,7 +210,7 @@ def test_full_pipeline_no_entry_signal_before_startup_candle_count() -> None:
     """No entries should be possible before startup_candle_count candles have elapsed."""
     sas = _load_strategy_module()
     y_ohlcv, x_ohlcv = make_oscillating_cointegrated_pair(n=400)
-    strategy = sas.StatArbSwing({"stake_currency": "USDC", "runmode": None})
+    strategy = sas.StatArbSwing({"stake_currency": "USDC", "runmode": None, "user_data_dir": tempfile.mkdtemp(prefix="hermes_test_")})
 
     df = _run_full_pipeline(strategy, y_ohlcv, x_ohlcv)
 
@@ -262,7 +263,7 @@ def test_full_pipeline_reads_hyperopt_parameter_value_dynamically() -> None:
     """
     sas = _load_strategy_module()
     y_ohlcv, x_ohlcv = make_oscillating_cointegrated_pair(n=400)
-    strategy = sas.StatArbSwing({"stake_currency": "USDC", "runmode": None})
+    strategy = sas.StatArbSwing({"stake_currency": "USDC", "runmode": None, "user_data_dir": tempfile.mkdtemp(prefix="hermes_test_")})
 
     baseline_df = _run_full_pipeline(strategy, y_ohlcv.copy(), x_ohlcv)
     baseline_entries = int(baseline_df["enter_long"].sum() + baseline_df["enter_short"].sum())
