@@ -1,0 +1,93 @@
+{
+    "$schema": "https://schema.freqtrade.io/schema.json",
+    "//": "RESEARCH-ONLY config -- for backtesting TrendFollowCore (Path A) against Hyperliquid 4h history. Never used for live trading, never referenced by the live bot process (see user_data/config.json for that). Distinct from user_data/config-research.json / user_data/config-research-binance.json, which are scoped to StatArbSwing's two-leg BTC/ETH pair universe -- TrendFollowCore trades three independent pairs (BTC, ETH, SOL) with no cross-pair statistics, so it needs its own pair whitelist and timeframe (4h, not StatArbSwing's 5m) rather than overloading either existing research config.",
+
+    "trading_mode": "futures",
+    "margin_mode": "isolated",
+
+    "max_open_trades": 3,
+    "stake_currency": "USDC",
+    "stake_amount": "unlimited",
+    "tradable_balance_ratio": 0.99,
+    "fiat_display_currency": "USD",
+
+    "dry_run": true,
+    "dry_run_wallet": 1000,
+    "cancel_open_orders_on_exit": false,
+
+    "timeframe": "4h",
+
+    "unfilledtimeout": {
+        "entry": 10,
+        "exit": 10,
+        "exit_timeout_count": 0,
+        "unit": "minutes"
+    },
+
+    "entry_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1,
+        "price_last_balance": 0.0,
+        "check_depth_of_market": {
+            "enabled": false,
+            "bids_to_ask_delta": 1
+        }
+    },
+
+    "exit_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1
+    },
+
+    "exchange": {
+        "//": "Hyperliquid as a DATA SOURCE for research -- research backtests never place orders (dry_run is always true above, and hermes backtest never runs `freqtrade trade`), so this is safe to point at the live exchange without risk. Three independent pairs for TrendFollowCore, not StatArbSwing's two-leg pair. No walletAddress/privateKey needed: public OHLCV/market-metadata endpoints don't require authentication, and this config already has real, validated 4h history on disk (see RAILWAY.md's data-acquisition record) -- backtesting against it makes no network call at all.",
+        "name": "hyperliquid",
+        "walletAddress": "",
+        "privateKey": "",
+        "ccxt_config": {},
+        "ccxt_async_config": {},
+        "pair_whitelist": [
+            "BTC/USDC:USDC",
+            "ETH/USDC:USDC",
+            "SOL/USDC:USDC"
+        ],
+        "pair_blacklist": []
+    },
+
+    "pairlists": [
+        {
+            "method": "StaticPairList"
+        }
+    ],
+
+    "telegram": {
+        "enabled": false,
+        "token": "",
+        "chat_id": ""
+    },
+
+    "//api_server_security": "Same placeholder pattern as user_data/config.json: enabled is false, and these are deliberately obvious placeholders, never real secrets. See that file's own comment for the full rationale.",
+    "api_server": {
+        "enabled": false,
+        "listen_ip_address": "127.0.0.1",
+        "listen_port": 8080,
+        "verbosity": "error",
+        "jwt_secret_key": "INSECURE_PLACEHOLDER_COMMITTED_TO_GIT_REPLACE_VIA_CONFIG_PRIVATE_JSON",
+        "ws_token": "INSECURE_PLACEHOLDER_COMMITTED_TO_GIT_REPLACE_VIA_CONFIG_PRIVATE_JSON",
+        "CORS_origins": [],
+        "username": "changeme",
+        "password": "changeme"
+    },
+
+    "bot_name": "ff-trendfollow-research",
+    "strategy": "TrendFollowCore",
+    "strategy_path": "user_data/strategies",
+    "initial_state": "stopped",
+    "force_entry_enable": false,
+
+    "internals": {
+        "process_throttle_secs": 5
+    }
+}
