@@ -17,7 +17,7 @@ GitHub repository
 RAILWAY RESEARCH ENVIRONMENT  (this document)
     |
     v
-Historical market data  (Binance USD-M futures, research-only)
+Historical market data  (Hyperliquid primary / Binance USD-M futures secondary, research-only)
     |
     v
 Freqtrade backtests  (StatArbSwing, unchanged)
@@ -41,30 +41,47 @@ whitelist, or any strategy/risk parameter.
 | `Dockerfile` | Builds the research-worker image: installs `requirements.txt`, installs this repo (`pip install -e .`), runs as a non-root user. Default command is inert (`hermes --help`) — the real command is supplied per deploy, see below. |
 | `.dockerignore` | Keeps the image to source code only. Historical data, logs, and Hermes' SQLite history are runtime state, not image contents — they belong on a Railway Volume. |
 | `railway.json` | Tells Railway to build from the Dockerfile and run as a one-shot job (`restartPolicyType: NEVER` — a finished backtest should not be restarted in a loop). |
-| `user_data/config-research.json` | A **research-only** Freqtrade config: same pairs and timeframe as the live config (`BTC/USDC:USDC`, `ETH/USDC:USDC`, `5m`, since `StatArbSwing.Y_PAIR`/`X_PAIR` are hardcoded to these two), but `exchange.name` is `binanceusdm` — a historical-data source only. `dry_run` is always `true`; this file is never passed to `freqtrade trade`, only to `download-data`/`backtesting` (directly or via `hermes backtest`). Validated locally against Freqtrade's own `validate_config_consistency` — see "Local validation" below. |
+| `user_data/config-research.json` | **Primary** research-only Freqtrade config: same pairs and timeframe as the live config (`BTC/USDC:USDC`, `ETH/USDC:USDC`, `5m`, since `StatArbSwing.Y_PAIR`/`X_PAIR` are hardcoded to these two), and `exchange.name` is `hyperliquid` — the same exchange used live, reused here purely as a historical-data source. `dry_run` is always `true`; this file is never passed to `freqtrade trade`, only to `download-data`/`backtesting` (directly or via `hermes backtest`). Validated locally against Freqtrade's own `validate_config_consistency` — see "Local validation" below. |
+| `user_data/config-research-binance.json` | **Secondary/validation** research-only config — same shape, `exchange.name` is `binanceusdm`. Used to cross-check backtest results against a second venue after running the same backtest against the primary (Hyperliquid) config; not the default, not used unless explicitly passed via `-c`. |
 
-## Why Binance USD-M futures, not Hyperliquid, for data
+## Why Hyperliquid is primary and Binance is secondary/validation only
 
-Hyperliquid is blocked in the current sandbox by an outbound network
-policy (confirmed via `curl` and `hermes backtest` in earlier sessions —
-`403` on the `CONNECT` tunnel to `api.hyperliquid.xyz`, and the same for
-every Binance host tried from that sandbox too). Railway is expected to
-have a normal outbound network path, but the blocker we hit wasn't
-Hyperliquid-specific — it may not be reachable everywhere. Binance
-USD-M futures (`binanceusdm`) is used here strictly as a **candle data
-source**, so that:
+This module originally used Binance USD-M futures as the sole research
+data source, reasoning that Hyperliquid was blocked in the local
+sandbox (`403` on `CONNECT` to `api.hyperliquid.xyz`, matching every
+other exchange host tried from that sandbox — a sandbox-wide network
+policy, not evidence about any exchange specifically). Once actually
+deployed to Railway, that assumption got tested for real:
 
-- `StatArbSwing`'s hardcoded futures pairs (`BTC/USDC:USDC` /
-  `ETH/USDC:USDC`) keep the same market shape (perpetual futures,
-  USDC-margined) the strategy already assumes — no strategy changes
-  needed to backtest against this data.
-- The live exchange (Hyperliquid) is never touched by anything running
-  on Railway.
+- Railway's outbound network is genuinely unrestricted — confirmed by
+  getting a real HTTP response back from Binance, not a connection
+  block.
+- That response was `451 Service unavailable from a restricted
+  location`, per Binance's own `'b. Eligibility'` terms clause — a
+  geo-restriction on the Railway region the service was deployed to
+  (`us-west2`/`sfo`), not a network failure and not specific to this
+  repo.
 
-If Binance also turns out to be unreachable from wherever Railway
-actually runs, that's a data-source choice to revisit — not a reason to
-change the live exchange, which this module does not touch under any
-circumstance.
+Rather than switch Railway's region to chase that block, or drop
+Binance outright, the data-sourcing decision is: **Hyperliquid — the
+exchange `StatArbSwing` already trades live on — is the primary
+research data source** (`user_data/config-research.json`), since it was
+never actually tested from an unblocked network and reusing one
+exchange for both live trading and research is simpler than running
+two. **Binance USD-M futures remains available as a secondary,
+validation-only source** (`user_data/config-research-binance.json`) for
+cross-checking results against a second venue, once/if its
+geo-restriction from Railway's current region is no longer a blocker
+(a different region, a different network path, etc.) — it was not
+deleted, just demoted from default.
+
+Both configs keep `StatArbSwing`'s hardcoded futures pairs
+(`BTC/USDC:USDC` / `ETH/USDC:USDC`) and market shape (perpetual
+futures, USDC-margined) so no strategy changes are needed to backtest
+against either. **This pairing is purely a data-pipeline choice, not a
+validation of the strategy itself** — see the note on Path A/B below.
+The live exchange account is never touched by anything running on
+Railway regardless of which research config is used.
 
 ## The two future research hypotheses (not yet buildable)
 
@@ -75,16 +92,32 @@ exactly BTC/ETH, and neither hypothesis can run against it as-is:
 
 - **Path A — trend** (`BTC/USDC`, `ETH/USDC`, `SOL/USDC`): three legs,
   not two. This isn't a pairs-trading question at all; it needs a
-  different strategy shape than `StatArbSwing` provides.
+  different strategy shape than `StatArbSwing` provides. **This is
+  understood to be the actual production direction** — the BTC/ETH
+  pairing that `config-research.json`/`config-research-binance.json`
+  use is a leftover of `StatArbSwing` being the only strategy that
+  currently exists, not an endorsement of BTC/ETH mean reversion as a
+  validated thesis. Nothing in this repo has tested that thesis; running
+  a backtest against these configs proves the data pipeline works, not
+  that the strategy is sound.
 - **Path B — mean reversion** (`stETH/ETH`, `WBTC/BTC`, `cbETH/ETH`):
   these are staking-derivative/wrapped-asset *ratio* pairs, not
-  USDC-margined perpetual futures — they wouldn't exist as futures
-  markets on Binance or Hyperliquid at all. Testing this hypothesis
-  starts with the cointegration/ADF tooling that already exists
+  USDC-margined perpetual futures — they may not exist as futures
+  markets on Hyperliquid or Binance at all, and **which venue actually
+  lists each leg has not been checked** (this document previously
+  assumed neither exchange would have them; that assumption itself
+  hasn't been verified either). The correct next step, once network
+  access from an unblocked environment is confirmed working (see
+  "Local validation" below), is per-pair venue discovery: call
+  `ccxt.<exchange>().load_markets()` for each candidate exchange and
+  check whether both legs of each Path B pair actually appear — not
+  assumed to be Hyperliquid or Binance by default, and not assumed to
+  be a single venue for all three pairs. Testing the cointegration
+  hypothesis itself starts with the tooling that already exists
   (`stat_arb.signal.cointegration`, `stat_arb.risk.risk`) run offline
-  against spot/ratio price history, before any strategy is written
-  around it — exactly as you specified ("do NOT assume Path B is
-  cointegrated").
+  against whatever price history is actually available, before any
+  strategy is written around it — exactly as you specified ("do NOT
+  assume Path B is cointegrated").
 
 Building either is out of scope for this module (no new strategy, no
 FreqAI, no two-leg execution changes). What Railway gives you once
@@ -131,55 +164,77 @@ added here, per "do not implement these yet unless they already exist."
    ```
 
    (Before this will produce trades, the research data itself still
-   needs to exist under `user_data/data/binanceusdm/futures/` — via
+   needs to exist under `user_data/data/hyperliquid/futures/` — via
    `freqtrade download-data -c user_data/config-research.json --timerange ...`,
-   run once against the attached Volume. Neither command has been run
-   here; both were blocked by the sandbox's network policy in the prior
-   session, not by anything in this repo.)
+   run once against the attached Volume.)
+
+   To cross-check against the secondary (Binance) source instead, swap
+   `-c user_data/config-research.json` for `-c
+   user_data/config-research-binance.json` in either command — everything
+   else stays the same.
 4. **Read the result back**, either via `hermes analyze` (same command,
    same container) or by pulling `hermes_memory.sqlite3` off the Volume.
 
 ## Environment variables you'll eventually need
 
-None of these are secrets in the usual sense — Binance's public OHLCV
-endpoints need no authentication, and this environment never places
+None of these are secrets in the usual sense — Hyperliquid's and
+Binance's public OHLCV/market-metadata endpoints need no authentication
+for `download-data`/`backtesting`, and this environment never places
 orders. Nothing below was created, requested, or exposed by this
 module; this is a list for when you configure the Railway service.
 
 | Variable | Purpose | Required? |
 |---|---|---|
-| *(none)* | `binanceusdm` public market-data endpoints require no API key for `download-data`/`backtesting`. | — |
+| *(none)* | Public market-data endpoints (Hyperliquid primary, Binance secondary) require no API key for `download-data`/`backtesting`. | — |
 | `HERMES_API_USERNAME` / `HERMES_API_PASSWORD` | Only relevant if you ever run `hermes health` against a *live* bot's REST API from Railway — unrelated to the research path above. Not needed for backtesting. | No |
 
-If a future hypothesis genuinely needs authenticated data (e.g. a
-higher-rate-limit Binance API key), add it as a Railway service
-variable at that time — do not commit it to `user_data/config-research.json`
-or any file in this repo, consistent with how `user_data/config.json`
-already keeps Hyperliquid's `walletAddress`/`privateKey` out of git via
+If a future hypothesis genuinely needs authenticated data, add it as a
+Railway service variable at that time — do not commit it to either
+research config or any file in this repo, consistent with how
+`user_data/config.json` already keeps Hyperliquid's
+`walletAddress`/`privateKey` out of git via
 `user_data/config-private.json` (gitignored).
 
-## Local validation performed
+## Live verification performed on Railway
 
-Docker itself could not be exercised end-to-end in the sandbox this was
-built in — the `docker` CLI is present but no daemon is running
-(`docker info` fails with "cannot connect to the Docker daemon"), so no
-actual `docker build` was possible here. What *was* validated locally:
+Unlike the original version of this document (written before any real
+deploy existed), this has now actually been deployed and exercised:
 
-- `user_data/config-research.json` — valid JSON, and passes Freqtrade's
-  own `validate_config_consistency()` after resolving `StatArbSwing`
-  against it (the same check `freqtrade` runs before every real start,
-  and the same one `tests/test_strategy_validation.py` already asserts
-  for the live config).
+- **Docker build**: confirmed working — Railway builds this repo's
+  `Dockerfile` successfully (had to fix the service's builder setting
+  once; see below).
+- **Volume**: created and mounted at `/app/user_data`.
+- **Start command precedence bug, found and fixed**: setting a start
+  command via the Railway dashboard/API had no effect — the container
+  kept running the Dockerfile's inert default. Root cause: Railway's
+  docs are explicit that config-as-code (`railway.json`) settings
+  always override dashboard/API settings for the same field, and
+  `railway.json` originally pinned `deploy.startCommand`. Fixed by
+  removing `startCommand` from `railway.json` entirely, so the
+  dashboard-set value now genuinely applies.
+- **Binance USD-M futures reachability**: confirmed *blocked* — real
+  HTTP `451` from `fapi.binance.com`, a Binance-side geo-restriction on
+  Railway's deployed region (see "Why Hyperliquid is primary" above).
+  This is what triggered demoting Binance to secondary/validation.
+- **Hyperliquid reachability**: this is what this change (Hyperliquid as
+  primary) is meant to test — genuinely unverified as of writing this
+  section. The next redeploy against the updated
+  `user_data/config-research.json` is the actual test; check that
+  deployment's logs for whether market/`exchangeInfo` loading succeeds
+  or fails, and don't assume either outcome here.
+
+## Local validation performed (before any Railway deploy existed)
+
+- Both `user_data/config-research.json` and
+  `user_data/config-research-binance.json` — valid JSON, and pass
+  Freqtrade's own `validate_config_consistency()` after resolving
+  `StatArbSwing` against them (the same check `freqtrade` runs before
+  every real start, and the same one `tests/test_strategy_validation.py`
+  already asserts for the live config).
 - `railway.json` — valid JSON, matches Railway's documented schema
-  shape (`build.builder`/`build.dockerfilePath`,
-  `deploy.startCommand`/`deploy.restartPolicyType`).
+  shape.
 - `Dockerfile` — reviewed by hand against `requirements.txt` /
-  `pyproject.toml` (base image Python version matches
-  `requires-python = ">=3.11"`; installs the same dependencies local
-  dev uses, no extras invented); could not be built without a daemon.
+  `pyproject.toml` before ever being built for real (now confirmed
+  building successfully on Railway — see above).
 - Full existing test suite (`pytest`) — run unchanged, to confirm this
   module didn't touch or break anything it shouldn't have.
-
-**A real `docker build .` should be run** (locally with Docker Desktop,
-in CI, or via Railway's own build step) before relying on this image —
-that step was not possible here.

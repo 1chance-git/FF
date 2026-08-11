@@ -1,6 +1,6 @@
 {
     "$schema": "https://schema.freqtrade.io/schema.json",
-    "//": "RESEARCH-ONLY config -- PRIMARY research data source. Never used for live trading, never referenced by the live bot process (see user_data/config.json for that; this file duplicates its exchange section but is a wholly separate config Freqtrade never merges with it). Reuses Hyperliquid -- the same exchange StatArbSwing already trades live on -- for backtest/download-data candles too, rather than a second exchange, per RAILWAY.md's data-sourcing decision. See user_data/config-research-binance.json for the secondary/validation data source (Binance USD-M futures), used for cross-checking results against a second venue, not as a default.",
+    "//": "RESEARCH-ONLY config -- SECONDARY/VALIDATION data source, not the default. Never used for live trading, never referenced by the live bot process (see user_data/config.json for that). Use this to cross-check backtest results against a second venue after running the same backtest against user_data/config-research.json (Hyperliquid, primary). As of introduction, Binance USD-M futures returns HTTP 451 'Service unavailable from a restricted location' when reached from Railway's current region (us-west2/sfo) -- a Binance-side geo-restriction, not a bug in this repo. Left in place for whenever that's no longer a blocker (a different Railway region, a different network path, etc.), not deleted.",
 
     "trading_mode": "futures",
     "margin_mode": "isolated",
@@ -42,10 +42,10 @@
     },
 
     "exchange": {
-        "//": "Hyperliquid as a DATA SOURCE for research -- research backtests never place orders (dry_run is always true above, and hermes backtest never runs `freqtrade trade`), so this is safe to point at the live exchange without risk. Same pairs as the live config, since StatArbSwing.Y_PAIR/X_PAIR are hardcoded to these two. UNVERIFIED as of this file's introduction: Hyperliquid access from Railway had not been tested from an unblocked network -- Binance USD-M futures (see config-research-binance.json) was the original choice, but returned HTTP 451 (geo-restricted) from Railway's current region, so this reverts to the live exchange instead of chasing that block. No walletAddress/privateKey needed: public OHLCV/market-metadata endpoints don't require authentication.",
-        "name": "hyperliquid",
-        "walletAddress": "",
-        "privateKey": "",
+        "//": "binanceusdm as a secondary DATA SOURCE only -- research backtests never place orders (dry_run is always true above, and hermes backtest never runs `freqtrade trade`). Same pairs as the primary (Hyperliquid) research config, since StatArbSwing.Y_PAIR/X_PAIR are hardcoded to these two. No API key/secret needed: public OHLCV endpoints don't require authentication (when reachable).",
+        "name": "binanceusdm",
+        "key": "",
+        "secret": "",
         "ccxt_config": {},
         "ccxt_async_config": {},
         "pair_whitelist": [
@@ -80,7 +80,7 @@
         "password": "changeme"
     },
 
-    "bot_name": "ff-stat-arb-research",
+    "bot_name": "ff-stat-arb-research-binance",
     "strategy": "StatArbSwing",
     "strategy_path": "user_data/strategies",
     "initial_state": "stopped",
