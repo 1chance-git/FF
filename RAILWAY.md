@@ -47,6 +47,17 @@ whitelist, or any strategy/risk parameter.
 
 ## Why Hyperliquid is primary and Binance is secondary/validation only
 
+> **Update, since this was written:** both are now confirmed broken as
+> *historical-data* sources, for two unrelated reasons — Binance is
+> geo-blocked (451) from Railway's region, and Hyperliquid is reachable
+> but Freqtrade's Hyperliquid integration doesn't support
+> `download-data` at all (see "Hyperliquid reachability" under "Live
+> verification performed on Railway" below for the full, verified
+> result). The primary/secondary framing below is left as-is because it
+> still explains *why* the repo is shaped this way and *what was tried*
+> — read it as history, not as a claim that either config currently
+> works for backtesting.
+
 This module originally used Binance USD-M futures as the sole research
 data source, reasoning that Hyperliquid was blocked in the local
 sandbox (`403` on `CONNECT` to `api.hyperliquid.xyz`, matching every
@@ -166,8 +177,14 @@ added here, per "do not implement these yet unless they already exist."
 
    (Before this will produce trades, the research data itself still
    needs to exist under `user_data/data/hyperliquid/futures/` — via
-   `freqtrade download-data -c user_data/config-research.json --timerange ...`,
-   run once against the attached Volume.)
+   `freqtrade download-data -c user_data/config-research.json --timerange ...
+   --user-data-dir user_data/data` (the Volume is mounted at
+   `/app/user_data/data`, not `/app/user_data` — see "Volume shadowing"
+   below), run once against the attached Volume. **As of the verified
+   result under "Live verification performed on Railway" below, this
+   step currently fails for Hyperliquid** — Freqtrade's Hyperliquid
+   integration doesn't support `download-data` at all, regardless of
+   network access. Read that section before assuming this step works.)
 
    To cross-check against the secondary (Binance) source instead, swap
    `-c user_data/config-research.json` for `-c
@@ -233,18 +250,62 @@ deploy existed), this has now actually been deployed and exercised:
   /app/user_data/data`), then drops to the `hermes` user via `su` before
   exec'ing the actual start command — the process itself still never
   runs as root.
+- **`redeploy` vs `deploy`, learned the hard way**: after updating the
+  service's start command via the API, two `redeploy` calls in a row
+  still ran the *old* command. `redeploy` only restarts the existing
+  container image — it doesn't rebuild, so config-only changes like
+  `startCommand` never take effect through it. A full `deploy` (image
+  rebuild) is required to pick up a changed start command. Worth
+  knowing for any future config change made outside a git push.
+- **`freqtrade download-data` argument error, found and fixed**: the
+  first real attempt to run `download-data` failed immediately with
+  `freqtrade: error: unrecognized arguments: --strategy StatArbSwing
+  --strategy-path user_data/strategies` — `--strategy`/`--strategy-path`
+  are `backtesting`-only flags, not accepted by `download-data`. Fixed
+  by dropping them from the start command for that run.
 - **Binance USD-M futures reachability**: confirmed *blocked* — real
   HTTP `451` from `fapi.binance.com`, a Binance-side geo-restriction on
   Railway's deployed region (see "Why Hyperliquid is primary" above).
   This is what triggered demoting Binance to secondary/validation.
-- **Hyperliquid reachability**: this is what this change (Hyperliquid as
-  primary) is meant to test — still unverified as of writing this
-  section, since every attempt so far failed before reaching the
-  exchange call (first on the missing-config-file bug, then on the
-  volume-permission error above). The next redeploy, with both fixes
-  in place, is the actual test; check that deployment's logs for
-  whether market/`exchangeInfo` loading succeeds or fails, and don't
-  assume either outcome here.
+- **Hyperliquid reachability: CONFIRMED REACHABLE, but cannot serve as
+  a historical-data source.** With the volume, permission, and argument
+  fixes above all in place, `freqtrade download-data -c
+  user_data/config-research.json --timerange 20240101-20240111
+  --user-data-dir user_data/data` actually ran to completion:
+  `check_exchange` passed ("Hyperliquid is officially supported"),
+  `dry_run` initialized, CCXT connected, and **markets loaded
+  successfully** — no connection error, no timeout, no geo-block like
+  Binance's 451. Network-wise, Hyperliquid works fine from Railway.
+  It then failed with a *different* kind of error entirely:
+
+  ```
+  freqtrade - ERROR - Historic data not available for Hyperliquid.
+  Hyperliquid does not support downloading trades or ohlcv data.
+  ```
+
+  This is not a network, region, or credentials problem — it's a gap
+  in Freqtrade's own Hyperliquid exchange integration (via CCXT):
+  historical OHLCV downloading simply isn't implemented for it, even
+  though live trading and market metadata are. **Practical
+  consequence: as things stand, neither configured exchange can serve
+  as a historical-data source for backtesting** — Binance USD-M
+  futures is geo-blocked from Railway's current region, and Hyperliquid
+  is reachable but Freqtrade can't pull candle history from it. Real
+  options going forward (none implemented, this is a decision point):
+  1. Find a third exchange with both `BTC/USDC:USDC`-shaped perps and
+     working Freqtrade OHLCV download support.
+  2. Use Hyperliquid for live trading (unchanged, already the plan) but
+     source backtest candle history from a different venue — e.g.
+     Binance from a Railway region outside its geo-block, if the
+     restriction turns out to be region-specific rather than
+     account/IP-range-specific.
+  3. Pull Hyperliquid historical data directly via its own REST/WS API
+     (bypassing `freqtrade download-data`), then convert it into
+     Freqtrade's feather format by hand — more work, but keeps
+     everything on one exchange.
+
+  None of these has been attempted; this section exists to record the
+  actual, verified result so the next step is a decision, not a guess.
 
 ## Local validation performed (before any Railway deploy existed)
 
