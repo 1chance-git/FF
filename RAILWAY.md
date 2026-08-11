@@ -38,7 +38,8 @@ whitelist, or any strategy/risk parameter.
 
 | File | Purpose |
 |---|---|
-| `Dockerfile` | Builds the research-worker image: installs `requirements.txt`, installs this repo (`pip install -e .`), runs as a non-root user. Default command is inert (`hermes --help`) — the real command is supplied per deploy, see below. |
+| `Dockerfile` | Builds the research-worker image: installs `requirements.txt`, installs this repo (`pip install -e .`), runs the actual process as a non-root user. Default command is inert (`hermes --help`) — the real command is supplied per deploy, see below. |
+| `docker-entrypoint.sh` | Runs first, as root, purely to `chown` the Railway Volume mounted at `/app/user_data/data` (Volumes are created empty and root-owned) before dropping to the non-root `hermes` user and exec'ing the real command. See "Live verification performed on Railway" for why this exists. |
 | `.dockerignore` | Keeps the image to source code only. Historical data, logs, and Hermes' SQLite history are runtime state, not image contents — they belong on a Railway Volume. |
 | `railway.json` | Tells Railway to build from the Dockerfile and run as a one-shot job (`restartPolicyType: NEVER` — a finished backtest should not be restarted in a loop). |
 | `user_data/config-research.json` | **Primary** research-only Freqtrade config: same pairs and timeframe as the live config (`BTC/USDC:USDC`, `ETH/USDC:USDC`, `5m`, since `StatArbSwing.Y_PAIR`/`X_PAIR` are hardcoded to these two), and `exchange.name` is `hyperliquid` — the same exchange used live, reused here purely as a historical-data source. `dry_run` is always `true`; this file is never passed to `freqtrade trade`, only to `download-data`/`backtesting` (directly or via `hermes backtest`). Validated locally against Freqtrade's own `validate_config_consistency` — see "Local validation" below. |
@@ -203,7 +204,9 @@ deploy existed), this has now actually been deployed and exercised:
 - **Docker build**: confirmed working — Railway builds this repo's
   `Dockerfile` successfully (had to fix the service's builder setting
   once; see below).
-- **Volume**: created and mounted at `/app/user_data`.
+- **Volume**: created; originally mounted at `/app/user_data`, which
+  shadowed the repo-baked config/strategy files (see "Volume shadowing"
+  below) and was moved to `/app/user_data/data`.
 - **Start command precedence bug, found and fixed**: setting a start
   command via the Railway dashboard/API had no effect — the container
   kept running the Dockerfile's inert default. Root cause: Railway's
@@ -212,16 +215,36 @@ deploy existed), this has now actually been deployed and exercised:
   `railway.json` originally pinned `deploy.startCommand`. Fixed by
   removing `startCommand` from `railway.json` entirely, so the
   dashboard-set value now genuinely applies.
+- **Volume shadowing repo files, found and fixed**: mounting the Volume
+  directly at `/app/user_data` overlaid an empty directory over the
+  baked-in `config-research.json`/`config.json`/`strategies/`, causing
+  `Path 'user_data/config-research.json' does not exist`. Fixed by
+  moving the mount path to `/app/user_data/data` (only the data
+  subdirectory needs to persist across deploys).
+- **Volume ownership permission error, found and fixed**: after the
+  mount-path fix, the config file loaded correctly but
+  `freqtrade backtesting` then failed with
+  `PermissionError: [Errno 13] Permission denied: '/app/user_data/data/hyperliquid'`.
+  Root cause: Railway Volumes are created empty and root-owned, but the
+  container runs as the non-root `hermes` user (uid 1000) per the
+  Dockerfile, so `hermes` couldn't create directories inside the mounted
+  volume. Fixed by adding `docker-entrypoint.sh`: the container now
+  starts as root (just long enough to `chown -R hermes:hermes
+  /app/user_data/data`), then drops to the `hermes` user via `su` before
+  exec'ing the actual start command — the process itself still never
+  runs as root.
 - **Binance USD-M futures reachability**: confirmed *blocked* — real
   HTTP `451` from `fapi.binance.com`, a Binance-side geo-restriction on
   Railway's deployed region (see "Why Hyperliquid is primary" above).
   This is what triggered demoting Binance to secondary/validation.
 - **Hyperliquid reachability**: this is what this change (Hyperliquid as
-  primary) is meant to test — genuinely unverified as of writing this
-  section. The next redeploy against the updated
-  `user_data/config-research.json` is the actual test; check that
-  deployment's logs for whether market/`exchangeInfo` loading succeeds
-  or fails, and don't assume either outcome here.
+  primary) is meant to test — still unverified as of writing this
+  section, since every attempt so far failed before reaching the
+  exchange call (first on the missing-config-file bug, then on the
+  volume-permission error above). The next redeploy, with both fixes
+  in place, is the actual test; check that deployment's logs for
+  whether market/`exchangeInfo` loading succeeds or fails, and don't
+  assume either outcome here.
 
 ## Local validation performed (before any Railway deploy existed)
 
