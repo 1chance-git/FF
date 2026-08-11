@@ -35,6 +35,7 @@ Design decisions
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -259,11 +260,14 @@ def _bucket_stats(groups: dict[str, list[TradeRecord]]) -> list[BucketStats]:
 
 
 def _zscore_bucket_label(value: float) -> str:
-    lower = (
-        int(value / _ZSCORE_BUCKET_WIDTH)
-        if value >= 0
-        else -(int(-value / _ZSCORE_BUCKET_WIDTH) + 1)
-    ) * _ZSCORE_BUCKET_WIDTH
+    """Bucket ``value`` into a half-open ``[lower, upper)`` interval of width `_ZSCORE_BUCKET_WIDTH`.
+
+    Uses floor division so a value exactly on a bucket boundary always
+    belongs to the bucket starting at that boundary (e.g. `0.5` and
+    `-0.5` both fall into their respective `[boundary, boundary + width)`
+    bucket), consistent on both sides of zero.
+    """
+    lower = math.floor(value / _ZSCORE_BUCKET_WIDTH) * _ZSCORE_BUCKET_WIDTH
     upper = lower + _ZSCORE_BUCKET_WIDTH
     return f"{lower:.1f} to {upper:.1f}"
 

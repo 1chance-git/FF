@@ -224,6 +224,21 @@ def test_performance_by_entry_zscore_handles_negative_values() -> None:
     assert buckets[0].label == "-2.5 to -2.0"
 
 
+def test_performance_by_entry_zscore_negative_boundary_matches_positive_mirror() -> None:
+    """A value exactly on a bucket boundary buckets the same way on both sides of zero.
+
+    Regression test: the bucketing formula used to floor negative
+    boundary values (e.g. -0.5) into the bucket *below* the boundary
+    (-1.0 to -0.5) while a positive boundary value (e.g. 0.5) correctly
+    bucketed into the bucket *starting at* the boundary (0.5 to 1.0) —
+    an inconsistent, off-by-one-bucket asymmetry.
+    """
+    positive_buckets = performance_by_entry_zscore([_trade(pnl=5.0, entry_zscore=0.5)])
+    negative_buckets = performance_by_entry_zscore([_trade(pnl=5.0, entry_zscore=-0.5)])
+    assert positive_buckets[0].label == "0.5 to 1.0"
+    assert negative_buckets[0].label == "-0.5 to 0.0"
+
+
 def test_performance_by_regime_groups_by_label() -> None:
     trades = [
         _trade(pnl=10.0, regime="mean_reverting"),
