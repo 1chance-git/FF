@@ -42,8 +42,9 @@ from hermes.backtest_report import (
 )
 from hermes.health import HealthChecker, HealthStatus
 from hermes.logging_config import LoggingConfig, configure_logging, get_logger
+from hermes.memory import DEFAULT_USER_DATA_DIR, USER_DATA_DIR_ENV_VAR
 from hermes.memory import BacktestResult as MemoryBacktestResult
-from hermes.memory import MemoryStore
+from hermes.memory import MemoryStore, memory_db_path
 from hermes.process import BotProcessManager, ProcessConfig
 
 logger = get_logger(__name__)
@@ -142,9 +143,16 @@ def health(api_url: str, username: str | None, password: str | None) -> None:
 @click.option("--timeout", default=None, type=float, help="Timeout in seconds.")
 @click.option(
     "--user-data-dir",
-    default=Path("user_data"),
+    default=None,
+    envvar=USER_DATA_DIR_ENV_VAR,
+    show_envvar=True,
     type=click.Path(path_type=Path),
-    help="Directory holding hermes_memory.sqlite3 (the same history trades are recorded to).",
+    help=(
+        "Directory holding hermes_memory.sqlite3 (the same history trades are "
+        f"recorded to). Defaults to {DEFAULT_USER_DATA_DIR}; set "
+        f"{USER_DATA_DIR_ENV_VAR} to point every Hermes command at persistent "
+        "storage instead (see RAILWAY.md)."
+    ),
 )
 def backtest(
     config_files: tuple[Path, ...],
@@ -153,7 +161,7 @@ def backtest(
     timeframe: str | None,
     strategy_path: Path | None,
     timeout: float | None,
-    user_data_dir: Path,
+    user_data_dir: Path | None,
 ) -> None:
     """Launch a Freqtrade backtest and print a summary."""
     bt_config = BacktestConfig(
@@ -166,7 +174,7 @@ def backtest(
 
     memory_store = None
     try:
-        memory_store = MemoryStore(user_data_dir / "hermes_memory.sqlite3")
+        memory_store = MemoryStore(memory_db_path(user_data_dir))
     except Exception:
         logger.exception(
             "[HERMES][MEMORY][ERROR] Failed to initialize Hermes memory store; "
@@ -365,11 +373,18 @@ def _database_unreadable_message(db_path: Path) -> str:
 @cli.command()
 @click.option(
     "--user-data-dir",
-    default=Path("user_data"),
+    default=None,
+    envvar=USER_DATA_DIR_ENV_VAR,
+    show_envvar=True,
     type=click.Path(path_type=Path),
-    help="Directory holding hermes_memory.sqlite3 (the same history trades are recorded to).",
+    help=(
+        "Directory holding hermes_memory.sqlite3 (the same history trades are "
+        f"recorded to). Defaults to {DEFAULT_USER_DATA_DIR}; set "
+        f"{USER_DATA_DIR_ENV_VAR} to point every Hermes command at persistent "
+        "storage instead (see RAILWAY.md)."
+    ),
 )
-def analyze(user_data_dir: Path) -> None:
+def analyze(user_data_dir: Path | None) -> None:
     """Analyze recorded trade history and print a plain-language report.
 
     Read-only: this command only reads from the existing Hermes SQLite
@@ -378,11 +393,11 @@ def analyze(user_data_dir: Path) -> None:
     history, never changes strategy parameters or trading decisions,
     and never deploys, optimizes, or retrains anything.
     """
-    if not user_data_dir.is_dir():
-        click.echo(_project_directory_not_detected_message(user_data_dir))
+    db_path = memory_db_path(user_data_dir)
+    if not db_path.parent.is_dir():
+        click.echo(_project_directory_not_detected_message(db_path.parent))
         sys.exit(1)
 
-    db_path = user_data_dir / "hermes_memory.sqlite3"
     try:
         store = MemoryStore(db_path)
     except Exception as exc:
@@ -406,9 +421,16 @@ def analyze(user_data_dir: Path) -> None:
 @cli.command(name="backtest-report")
 @click.option(
     "--user-data-dir",
-    default=Path("user_data"),
+    default=None,
+    envvar=USER_DATA_DIR_ENV_VAR,
+    show_envvar=True,
     type=click.Path(path_type=Path),
-    help="Directory holding hermes_memory.sqlite3 (the same history backtests are recorded to).",
+    help=(
+        "Directory holding hermes_memory.sqlite3 (the same history backtests are "
+        f"recorded to). Defaults to {DEFAULT_USER_DATA_DIR}; set "
+        f"{USER_DATA_DIR_ENV_VAR} to point every Hermes command at persistent "
+        "storage instead (see RAILWAY.md)."
+    ),
 )
 @click.option(
     "--strategy",
@@ -423,7 +445,7 @@ def analyze(user_data_dir: Path) -> None:
     help="How many of the most recent recorded backtests to search through.",
 )
 def backtest_report(
-    user_data_dir: Path, strategy: str | None, search_limit: int
+    user_data_dir: Path | None, strategy: str | None, search_limit: int
 ) -> None:
     """Report the results of the most recent *already recorded* backtest.
 
@@ -434,11 +456,11 @@ def backtest_report(
     where a completed backtest's results were recorded but never
     surfaced.
     """
-    if not user_data_dir.is_dir():
-        click.echo(_project_directory_not_detected_message(user_data_dir))
+    db_path = memory_db_path(user_data_dir)
+    if not db_path.parent.is_dir():
+        click.echo(_project_directory_not_detected_message(db_path.parent))
         sys.exit(1)
 
-    db_path = user_data_dir / "hermes_memory.sqlite3"
     try:
         store = MemoryStore(db_path)
     except Exception as exc:
