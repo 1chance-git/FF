@@ -37,11 +37,39 @@ Design decisions
   can sanity-check them against `hermes.backtest_report`'s parse of
   Freqtrade's printed summary, not to become the canonical source of
   aggregate metrics.
+* **`.zip` exports are read with the stdlib `zipfile` module directly,
+  not by importing `freqtrade.data.btanalysis`.** The installed Freqtrade
+  version (2026.7)'s own `store_backtest_results`
+  (`freqtrade/optimize/optimize_reports/bt_storage.py`) writes exactly one
+  JSON member into the zip, named after the zip's own filename with a
+  `.json` suffix (e.g. `backtest-result-<ts>.zip` contains
+  `backtest-result-<ts>.json`), alongside a sanitized config copy and
+  optional strategy/feather/signal files this module never touches. That
+  member name is derived here the same way Freqtrade derives it --
+  `zip_path.with_suffix(".json").name` -- confirmed against the actual
+  installed source, not guessed. Reusing Freqtrade's own
+  `load_file_from_zip`/`load_backtest_stats` was considered and rejected:
+  `hermes.backtest` already treats the installed `freqtrade` CLI, not its
+  Python internals, as the one thing Hermes depends on (see that module's
+  docstring) specifically so a Freqtrade upgrade never breaks Hermes
+  through an internal API change; importing `freqtrade.data.btanalysis`
+  here would quietly break that boundary. The zip payload, once read, is
+  fed through the exact same `_extract_trade_dicts`/`_parse_trade`
+  pipeline `.json` exports already use -- no second parser, no duplicated
+  aggregation.
+* **Reading a member out of a zip in memory, by its one expected name,
+  is inherently safe against zip-slip/path-traversal** -- nothing is ever
+  extracted to the filesystem, so a crafted member name elsewhere in the
+  archive (e.g. containing `../`) is simply never opened, let alone
+  written anywhere. `_read_zip_export` only ever calls
+  `ZipFile.open(<the one name it computed>)`; every other entry in the
+  archive is inert as far as this module is concerned.
 """
 
 from __future__ import annotations
 
 import json
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -146,8 +174,20 @@ class TradeReport:
         return counts
 
 
+_LAST_RESULT_FILENAME = ".last_result.json"
+
+
 def find_latest_export_file(export_directory: Path) -> Path | None:
-    """The most recently modified `backtest-result-*.json` under `export_directory`.
+    """The latest backtest export under `export_directory` (`.zip` or `.json`).
+
+    Prefers Freqtrade's own `.last_result.json` pointer file (written by
+    `store_backtest_results` alongside every export) when present and
+    valid -- that is Freqtrade's own authoritative "latest" marker, more
+    precise than an mtime comparison. Falls back to the most recently
+    modified `backtest-result-*.{json,zip}` file (excluding the
+    `.meta.json` sidecar) when the pointer is absent or unusable, which
+    also keeps this working against older export directories that predate
+    the pointer file.
 
     Returns `None` (not an error) if the directory doesn't exist yet or
     contains no matching file -- a caller asking before any backtest has
@@ -157,10 +197,21 @@ def find_latest_export_file(export_directory: Path) -> Path | None:
     if not export_directory.is_dir():
         return None
 
+    pointer = export_directory / _LAST_RESULT_FILENAME
+    if pointer.is_file():
+        try:
+            latest_name = json.loads(pointer.read_text()).get("latest_backtest")
+        except (OSError, json.JSONDecodeError):
+            latest_name = None
+        if isinstance(latest_name, str):
+            candidate = export_directory / latest_name
+            if candidate.is_file():
+                return candidate
+
     candidates = [
         p
-        for p in export_directory.glob("backtest-result-*.json")
-        if not p.name.endswith(".meta.json")
+        for p in export_directory.glob("backtest-result-*")
+        if p.suffix in (".json", ".zip") and not p.name.endswith(".meta.json")
     ]
     if not candidates:
         return None
@@ -224,14 +275,54 @@ def _parse_trade(raw: dict[str, Any]) -> Trade:
     )
 
 
+def _zip_json_member_name(zip_path: Path) -> str:
+    """The JSON member name Freqtrade's own zip export gives its stats payload.
+
+    `store_backtest_results` names it after the zip's own filename with a
+    `.json` suffix -- confirmed against the installed Freqtrade source
+    (`freqtrade/optimize/optimize_reports/bt_storage.py`), not guessed.
+    """
+    return zip_path.with_suffix(".json").name
+
+
+def _read_zip_export(zip_path: Path) -> Any:
+    """Read Freqtrade's stats JSON payload out of its native `.zip` export.
+
+    Reads the one expected member entirely in memory via `ZipFile.open` --
+    nothing is ever extracted to the filesystem, so no other entry in the
+    archive (sanitized config copy, strategy source, market-change/wallet
+    feather files, or anything else a crafted zip might contain under a
+    path-traversing name) is ever opened, let alone written anywhere.
+    """
+    member_name = _zip_json_member_name(zip_path)
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            try:
+                with archive.open(member_name) as member:
+                    raw = member.read()
+            except KeyError as exc:
+                raise TradeReportError(
+                    f"expected member {member_name!r} not found in {zip_path}"
+                ) from exc
+    except FileNotFoundError as exc:
+        raise TradeReportError(f"cannot read export file {zip_path}: {exc}") from exc
+    except zipfile.BadZipFile as exc:
+        raise TradeReportError(f"cannot read export file {zip_path}: not a valid zip: {exc}") from exc
+
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TradeReportError(f"cannot read export file {zip_path}: {exc}") from exc
+
+
 def load_trades_export(path: Path, *, strategy: str | None = None) -> TradeReport:
-    """Parse a Freqtrade trade export JSON file into a `TradeReport`.
+    """Parse a Freqtrade trade export (`.json` or native `.zip`) into a `TradeReport`.
 
     Parameters
     ----------
     path:
-        Path to a `backtest-result-*.json` file (not its `.meta.json`
-        sibling).
+        Path to a `backtest-result-*.json` or `backtest-result-*.zip` file
+        (not the `.json`'s `.meta.json` sibling).
     strategy:
         Which strategy's trades to read, if the export file recorded more
         than one. Ignored for the flat (single-strategy-implicit) export
@@ -240,13 +331,18 @@ def load_trades_export(path: Path, *, strategy: str | None = None) -> TradeRepor
     Raises
     ------
     TradeReportError
-        If the file isn't valid JSON, or its shape isn't recognized.
+        If the file can't be read/isn't valid JSON (or a valid zip
+        containing the expected JSON member), or its shape isn't
+        recognized.
     """
     path = Path(path)
-    try:
-        payload = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise TradeReportError(f"cannot read export file {path}: {exc}") from exc
+    if path.suffix == ".zip":
+        payload = _read_zip_export(path)
+    else:
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise TradeReportError(f"cannot read export file {path}: {exc}") from exc
 
     raw_trades = _extract_trade_dicts(payload, strategy=strategy)
     return TradeReport(trades=tuple(_parse_trade(t) for t in raw_trades), source_path=path)
