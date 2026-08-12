@@ -73,7 +73,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
-from hermes.memory import ErrorEvent, MemoryStore, ProcessEvent
+from hermes.memory import ErrorEvent, MemoryStore, ProcessEvent, memory_db_path
 from hermes.process import ProcessConfig, ProcessError, build_trade_command
 
 logger = logging.getLogger(__name__)
@@ -407,7 +407,11 @@ if __name__ == "__main__":
     parser.add_argument("--strategy", required=True)
     parser.add_argument("--strategy-path", default=None)
     parser.add_argument("--pid-file", default="user_data/hermes_supervisor.pid")
-    parser.add_argument("--user-data-dir", default="user_data")
+    # Defaults to None so the shared resolver in hermes.memory decides,
+    # keeping the supervisor on exactly the same memory location as every
+    # `hermes` CLI command (including HERMES_USER_DATA_DIR support) rather
+    # than pinning its own copy of the default.
+    parser.add_argument("--user-data-dir", default=None)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -421,7 +425,7 @@ if __name__ == "__main__":
 
     memory_store = None
     try:
-        memory_store = MemoryStore(Path(args.user_data_dir) / "hermes_memory.sqlite3")
+        memory_store = MemoryStore(memory_db_path(args.user_data_dir))
     except Exception:
         logger.exception(
             "Failed to initialize Hermes memory store; process events will not be recorded"

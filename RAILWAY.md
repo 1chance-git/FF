@@ -263,19 +263,46 @@ deploy existed), this has now actually been deployed and exercised:
   --strategy-path user_data/strategies` — `--strategy`/`--strategy-path`
   are `backtesting`-only flags, not accepted by `download-data`. Fixed
   by dropping them from the start command for that run.
-- **Hermes memory is on ephemeral storage, not the Volume** (found while
-  trying to read a completed backtest's results back; **not fixed** —
-  recorded here as a known limitation). The Volume is mounted at
-  `/app/user_data/data`, but `MemoryStore`'s default path is
-  `user_data/hermes_memory.sqlite3` → `/app/user_data/hermes_memory.sqlite3`,
-  which sits *beside* the mount point rather than inside it. Every
-  container therefore starts with an empty history and loses whatever
-  it recorded when it exits, so a backtest's persisted result cannot be
-  read back by any later deployment. Two ways out, neither applied here:
-  point `hermes backtest --user-data-dir` at a directory inside the
-  Volume, or move the Volume's mount path up to `/app/user_data` (which
-  would re-introduce the shadowing problem described above unless the
-  baked-in config/strategy files are relocated first).
+- **Hermes memory was on ephemeral storage, not the Volume — now fixed.**
+  Found while trying to read a completed backtest's results back: the
+  Volume is mounted at `/app/user_data/data`, but `MemoryStore`'s default
+  path resolved to `/app/user_data/hermes_memory.sqlite3`, which sits
+  *beside* the mount point rather than inside it. Every container
+  therefore started with an empty history and lost whatever it recorded
+  when it exited, so a backtest's persisted result could not be read back
+  by any later deployment.
+
+  **The fix reuses the `--user-data-dir` abstraction that already
+  existed** on every Hermes command, rather than adding a competing
+  configuration system or hard-coding a Railway path into Hermes: that
+  option is now also settable via the `HERMES_USER_DATA_DIR` environment
+  variable (the same `envvar=` mechanism `HERMES_API_USERNAME` /
+  `HERMES_API_PASSWORD` already used), and `hermes.memory.memory_db_path`
+  is the single resolver every reader and writer shares — the CLI's
+  `backtest` / `analyze` / `backtest-report` commands and the supervisor.
+  Setting one Railway service variable therefore moves *all* of Hermes'
+  history onto the Volume at once, with no per-command start-command
+  fiddling and no change to local-development behavior (the default is
+  still `user_data`, and an explicit `--user-data-dir` still wins over
+  the environment).
+
+  **Railway service variable required for persistence:**
+
+  ```
+  HERMES_USER_DATA_DIR=/app/user_data/data
+  ```
+
+  With that set, Hermes memory lives at
+  `/app/user_data/data/hermes_memory.sqlite3` — inside the Volume,
+  alongside the historical OHLCV/funding/mark data — and survives
+  container restarts.
+
+  Note this does **not** cover `StatArbSwing`'s own live-trade recording,
+  which derives its path from Freqtrade's `user_data_dir` config value
+  rather than from Hermes' resolver. That path is unchanged and remains
+  ephemeral on Railway; it was deliberately left alone (live strategy
+  code was out of scope for the infrastructure change) and matters only
+  for live/dry-run trade history, not for backtest records.
 - **Binance USD-M futures reachability**: confirmed *blocked* — real
   HTTP `451` from `fapi.binance.com`, a Binance-side geo-restriction on
   Railway's deployed region (see "Why Hyperliquid is primary" above).

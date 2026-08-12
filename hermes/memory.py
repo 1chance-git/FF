@@ -62,6 +62,50 @@ class MemoryStoreError(Exception):
     """Raised for unrecoverable memory-store failures (schema init only)."""
 
 
+# -- Where Hermes memory lives -----------------------------------------------
+#
+# One source of truth, shared by every writer and reader of this database
+# (hermes.cli's backtest/analyze/backtest-report commands and
+# hermes.supervisor), so they can never silently resolve to different files
+# — which is exactly the failure mode that made a completed backtest's
+# recorded result unreadable on Railway.
+#
+# The directory is deliberately *configurable* rather than hard-coded:
+# deployments whose persistent storage is mounted somewhere other than the
+# repo-relative default (e.g. Railway, whose Volume mounts at
+# `/app/user_data/data`) point HERMES_USER_DATA_DIR at that mount instead of
+# passing --user-data-dir to every single command. No deployment-specific
+# path appears anywhere in Hermes' own logic.
+
+MEMORY_DB_FILENAME = "hermes_memory.sqlite3"
+USER_DATA_DIR_ENV_VAR = "HERMES_USER_DATA_DIR"
+DEFAULT_USER_DATA_DIR = Path("user_data")
+
+
+def default_user_data_dir() -> Path:
+    """The user-data directory to use when a caller didn't name one.
+
+    Reads :data:`USER_DATA_DIR_ENV_VAR` at call time (not import time), so
+    tests and processes can set it per-invocation, falling back to
+    :data:`DEFAULT_USER_DATA_DIR` — which keeps local development and the
+    existing test suite on exactly the behavior they had before.
+    """
+    from os import environ
+
+    configured = environ.get(USER_DATA_DIR_ENV_VAR)
+    return Path(configured) if configured else DEFAULT_USER_DATA_DIR
+
+
+def memory_db_path(user_data_dir: Path | str | None = None) -> Path:
+    """Resolve the Hermes memory database path.
+
+    Passing ``user_data_dir`` (e.g. from a ``--user-data-dir`` flag) wins;
+    passing ``None`` defers to :func:`default_user_data_dir`.
+    """
+    base = Path(user_data_dir) if user_data_dir is not None else default_user_data_dir()
+    return base / MEMORY_DB_FILENAME
+
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
