@@ -16,6 +16,9 @@ Commands
 * ``hermes backtest`` — launch a backtest via :mod:`hermes.backtest`.
 * ``hermes analyze`` — read-only report over recorded trade history via
   :mod:`hermes.analyzer`.
+* ``hermes backtest-report`` — read-only report of an *already recorded*
+  backtest's Freqtrade results, via :mod:`hermes.backtest_report`. Never
+  runs a backtest; it only reads what a previous run already persisted.
 * ``hermes start`` / ``stop`` / ``restart`` / ``status`` — process
   lifecycle via :mod:`hermes.process`.
 """
@@ -32,8 +35,14 @@ from rich.table import Table
 from hermes.analyzer import AnalysisReport
 from hermes.analyzer import analyze as analyze_history
 from hermes.backtest import BacktestConfig, BacktestLauncher
+from hermes.backtest_report import (
+    BacktestReport,
+    extract_stdout,
+    parse_backtest_stdout,
+)
 from hermes.health import HealthChecker, HealthStatus
 from hermes.logging_config import LoggingConfig, configure_logging, get_logger
+from hermes.memory import BacktestResult as MemoryBacktestResult
 from hermes.memory import MemoryStore
 from hermes.process import BotProcessManager, ProcessConfig
 
@@ -219,6 +228,113 @@ def render_analysis_report(report: AnalysisReport) -> str:
     return "\n".join(lines)
 
 
+def render_backtest_report(
+    record: MemoryBacktestResult, report: BacktestReport
+) -> str:
+    """Format one recorded backtest's Freqtrade results as plain text.
+
+    Pure formatting only — every number comes from `report`, which was
+    parsed out of the stdout Freqtrade itself printed and Hermes
+    already persisted (see :mod:`hermes.backtest_report`). Nothing here
+    recomputes a metric, and nothing re-runs a backtest.
+
+    Fields Freqtrade didn't print are rendered as ``N/A`` rather than
+    guessed or omitted silently, so a reader can tell "not measured"
+    apart from "measured as zero".
+    """
+
+    def show(value: object, suffix: str = "") -> str:
+        return "N/A" if value is None else f"{value}{suffix}"
+
+    lines = ["[HERMES][BACKTEST REPORT]", ""]
+    lines.append(f"STRATEGY: {record.strategy}")
+    lines.append(f"TIMERANGE: {record.timerange or 'N/A'}")
+    if record.recorded_at is not None:
+        lines.append(f"RECORDED AT: {record.recorded_at.isoformat()}")
+
+    metrics = record.metrics or {}
+    lines.append(f"EXIT CODE: {show(metrics.get('exit_code'))}")
+    lines.append(f"SUCCEEDED: {show(metrics.get('succeeded'))}")
+    lines.append(f"TIMEFRAME: {metrics.get('timeframe') or 'N/A'}")
+    lines.append("")
+
+    if not report.parsed_anything:
+        lines.append(
+            "No Freqtrade results tables were found in the recorded output."
+        )
+        lines.append(
+            "This normally means the backtest produced no trades, or failed "
+            "before printing results."
+        )
+        lines.append("")
+        lines.append("STATUS: NO RESULTS RECORDED")
+        return "\n".join(lines)
+
+    win_rate = report.win_rate_pct
+    lines.append(f"TRADES: {show(report.total_trades)}")
+    lines.append(f"WINS: {show(report.wins)}")
+    lines.append(f"LOSSES: {show(report.losses)}")
+    lines.append(f"DRAWS: {show(report.draws)}")
+    lines.append(
+        f"WIN RATE: {'N/A' if win_rate is None else f'{win_rate:.1f}%'}"
+    )
+    lines.append(f"LONG TRADES: {show(report.long_trades)}")
+    lines.append(f"SHORT TRADES: {show(report.short_trades)}")
+    lines.append("")
+
+    lines.append(f"PROFIT/LOSS: {show(report.profit_total_abs)}")
+    lines.append(
+        "PROFIT/LOSS %: "
+        + (
+            "N/A"
+            if report.profit_total_pct is None
+            else f"{report.profit_total_pct}%"
+        )
+    )
+    lines.append(f"PROFIT FACTOR: {show(report.profit_factor)}")
+    lines.append(f"MAX DRAWDOWN: {show(report.max_drawdown)}")
+    lines.append(f"AVG TRADE DURATION: {show(report.avg_trade_duration)}")
+    lines.append(f"STARTING BALANCE: {show(report.starting_balance)}")
+    lines.append(f"FINAL BALANCE: {show(report.final_balance)}")
+    lines.append("")
+
+    if report.pair_results:
+        lines.append("PER PAIR:")
+        for pair_result in report.pair_results:
+            pair_win_rate = (
+                "N/A"
+                if pair_result.win_rate_pct is None
+                else f"{pair_result.win_rate_pct:.1f}%"
+            )
+            lines.append(
+                f"  {pair_result.pair}: {pair_result.trades} trades, "
+                f"{show(pair_result.profit_total_abs)} profit, "
+                f"{pair_result.wins}W/{pair_result.draws}D/{pair_result.losses}L, "
+                f"win rate {pair_win_rate}"
+            )
+        lines.append("")
+
+    lines.append("STATUS: OBSERVATION ONLY")
+    return "\n".join(lines)
+
+
+_NO_BACKTEST_RECORDS_MESSAGE = (
+    "[HERMES][BACKTEST REPORT]\n"
+    "No backtest results have been recorded yet.\n\n"
+    "Hermes records a result every time a backtest runs through\n"
+    "`hermes backtest`. If a backtest did run but nothing is recorded here,\n"
+    "the history database it was written to is not the one being read now\n"
+    "(for example, a container with its own short-lived filesystem)."
+)
+
+
+_NO_STDOUT_RECORDED_MESSAGE = (
+    "[HERMES][BACKTEST REPORT]\n"
+    "The recorded backtest has no captured output to report on.\n\n"
+    "This record predates output capture, or stored something unreadable."
+)
+
+
 _INSUFFICIENT_DATA_MESSAGE = (
     "[HERMES][ANALYSIS]\nInsufficient historical data for meaningful analysis."
 )
@@ -285,6 +401,72 @@ def analyze(user_data_dir: Path) -> None:
         return
 
     click.echo(render_analysis_report(report))
+
+
+@cli.command(name="backtest-report")
+@click.option(
+    "--user-data-dir",
+    default=Path("user_data"),
+    type=click.Path(path_type=Path),
+    help="Directory holding hermes_memory.sqlite3 (the same history backtests are recorded to).",
+)
+@click.option(
+    "--strategy",
+    default=None,
+    help="Only consider recorded backtests for this strategy.",
+)
+@click.option(
+    "--search-limit",
+    default=50,
+    show_default=True,
+    type=int,
+    help="How many of the most recent recorded backtests to search through.",
+)
+def backtest_report(
+    user_data_dir: Path, strategy: str | None, search_limit: int
+) -> None:
+    """Report the results of the most recent *already recorded* backtest.
+
+    Strictly read-only: this command never launches a backtest, never
+    starts a subprocess, and never writes to Hermes' history. It reads
+    the stdout that `hermes backtest` already captured and persisted,
+    and reports the numbers Freqtrade itself printed — closing the gap
+    where a completed backtest's results were recorded but never
+    surfaced.
+    """
+    if not user_data_dir.is_dir():
+        click.echo(_project_directory_not_detected_message(user_data_dir))
+        sys.exit(1)
+
+    db_path = user_data_dir / "hermes_memory.sqlite3"
+    try:
+        store = MemoryStore(db_path)
+    except Exception as exc:
+        logger.error(
+            "[HERMES][MEMORY][ERROR] Failed to open Hermes memory database at %s: %s",
+            db_path,
+            exc,
+        )
+        click.echo(_database_unreadable_message(db_path))
+        sys.exit(1)
+
+    records = store.get_backtest_results(limit=search_limit)
+    if strategy is not None:
+        records = [record for record in records if record.strategy == strategy]
+
+    if not records:
+        click.echo(_NO_BACKTEST_RECORDS_MESSAGE)
+        sys.exit(1)
+
+    # get_backtest_results returns oldest-first; the most recent run is last.
+    record = records[-1]
+
+    stdout = extract_stdout(record.metrics)
+    if stdout is None:
+        click.echo(_NO_STDOUT_RECORDED_MESSAGE)
+        sys.exit(1)
+
+    click.echo(render_backtest_report(record, parse_backtest_stdout(stdout)))
 
 
 def _process_manager(config_files: tuple[Path, ...], strategy: str, pid_file: Path) -> BotProcessManager:
