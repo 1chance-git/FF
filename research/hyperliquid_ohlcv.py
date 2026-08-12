@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -135,6 +136,73 @@ def fetch_candle_snapshot(
             f"expected a JSON list of candles, got {type(data).__name__}: {str(data)[:200]}"
         )
     return data
+
+
+# Verified live from Railway against Hyperliquid's real API (see RAILWAY.md's
+# funding-rate/mark-data audit) -- NOT assumed: fundingHistory's real per-request
+# cap is 500 entries (candleSnapshot's is ~5000; the two endpoints are not
+# symmetric), and real historical spacing between entries is NOT a clean,
+# uniform 1h throughout -- the earliest available window (~2023) averages
+# roughly 2h between entries. validate_funding_rate reports actual observed
+# gaps rather than hard-failing on a fixed expected interval, precisely because
+# of this measured (not assumed) irregularity.
+HYPERLIQUID_FUNDING_HISTORY_REQUEST_CAP = 500
+
+
+def fetch_funding_rate_snapshot(
+    coin: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+    *,
+    url: str = HYPERLIQUID_INFO_URL,
+    timeout: float = 25.0,
+) -> list[dict[str, Any]]:
+    """One raw call to Hyperliquid's ``fundingHistory`` info endpoint.
+
+    ``interval`` is accepted but ignored -- funding-rate history has no
+    interval concept in Hyperliquid's API (unlike ``candleSnapshot``).
+    It exists purely so this function's call signature matches
+    ``fetch_candle_snapshot``'s, letting ``paginate_raw``/``paginate_candles``
+    page this endpoint too without any change to their (already tested)
+    generic ``fetch(coin, interval, start_ms, end_ms)`` calling convention.
+
+    Returns the raw list of ``{"coin", "fundingRate", "premium", "time"}``
+    dicts exactly as Hyperliquid sends them, each additionally carrying a
+    ``"t"`` key (a copy of ``"time"``) so the same downstream
+    pagination/dedup machinery that keys off candle dicts' ``"t"`` field
+    (see ``dedupe_and_sort``) works here unmodified too. Raises
+    ``HyperliquidAPIError`` on the same failure shapes as
+    ``fetch_candle_snapshot`` (non-200, non-JSON, non-list response).
+    """
+    body = json.dumps({"type": "fundingHistory", "coin": coin, "startTime": start_ms, "endTime": end_ms}).encode()
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.status
+            raw = resp.read()
+    except urllib.error.URLError as exc:
+        raise HyperliquidAPIError(f"request to {url} failed: {exc}") from exc
+
+    if status != 200:
+        raise HyperliquidAPIError(f"unexpected HTTP status {status} from {url}")
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HyperliquidAPIError(f"response body was not valid JSON: {exc}") from exc
+
+    if not isinstance(data, list):
+        raise HyperliquidAPIError(
+            f"expected a JSON list of funding entries, got {type(data).__name__}: {str(data)[:200]}"
+        )
+
+    normalized = []
+    for entry in data:
+        if "time" not in entry:
+            raise HyperliquidAPIError(f"funding history entry missing 'time' field: {entry!r}")
+        normalized.append({**entry, "t": entry["time"]})
+    return normalized
 
 
 FetchFn = Callable[..., list[dict[str, Any]]]
@@ -430,6 +498,168 @@ def run_pipeline(
         if freqtrade_format_ok:
             read_back = read_back_from_freqtrade(
                 datadir=datadir, pair=pair, timeframe=interval, candle_type=candle_type
+            )
+            freqtrade_readback_ok = len(read_back) == len(df) and list(read_back.columns) == OHLCV_COLUMNS
+
+    return PipelineResult(
+        api_ok=api_ok,
+        download_ok=len(raw) > 0,
+        pagination_requests=pagination.requests_made,
+        dedup_removed=dedup_removed,
+        validation=validation,
+        freqtrade_format_ok=freqtrade_format_ok,
+        freqtrade_readback_ok=freqtrade_readback_ok,
+        candle_count=len(df),
+        first_date=df["date"].iloc[0].to_pydatetime() if not df.empty else None,
+        last_date=df["date"].iloc[-1].to_pydatetime() if not df.empty else None,
+        output_path=output_path,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Funding-rate auxiliary data (futures backtesting requirement)
+#
+# Freqtrade's futures backtesting engine (freqtrade/optimize/backtesting.py)
+# loads two auxiliary series beyond the strategy's own OHLCV, per pair:
+#   - CandleType.FUNDING_RATE at exchange.get_option("funding_fee_timeframe")
+#   - a "mark" series at exchange.get_option("mark_ohlcv_timeframe"), typed
+#     as exchange.get_option("mark_ohlcv_price")
+# For Hyperliquid specifically (freqtrade/exchange/hyperliquid.py's
+# _ft_has_futures), both timeframes default to "1h" (from the base Exchange
+# class -- Hyperliquid doesn't override them) and mark_ohlcv_price is
+# "futures" (Hyperliquid-specific override) -- i.e. Hyperliquid's "mark"
+# series IS its regular futures OHLCV, just at 1h, not a separate mark-price
+# feed. That means "mark/futures 1h" needs no new code at all: it's exactly
+# run_pipeline(interval="1h", candle_type="futures") already defined above.
+# Only funding_rate is a genuinely new data shape, handled below.
+#
+# Real format verified live from Railway (not assumed) against Hyperliquid's
+# fundingHistory endpoint, and cross-checked against Freqtrade's own
+# Exchange._fetch_funding_rate_history (which converts CCXT's parsed
+# {"fundingRate": ...} into a [timestamp, fundingRate, 0, 0, 0, 0] "candle"
+# row -- i.e. only the "open" column carries real data for funding-rate
+# series; high/low/close/volume are always 0). funding_rate_to_dataframe
+# mirrors that exact convention so save_to_freqtrade's output is
+# indistinguishable from what Freqtrade's own machinery would have written.
+# ---------------------------------------------------------------------------
+
+
+def funding_rate_to_dataframe(raw_entries: list[dict[str, Any]]) -> pd.DataFrame:
+    """Convert Hyperliquid's raw fundingHistory entries to the candle-shaped
+    OHLCV frame Freqtrade's own funding-rate loading expects: ``open`` holds
+    the funding rate, ``high``/``low``/``close``/``volume`` are always 0.0
+    (matching ``freqtrade.exchange.Exchange._fetch_funding_rate_history``'s
+    own ``[timestamp, fundingRate, 0, 0, 0, 0]`` convention exactly).
+    """
+    if not raw_entries:
+        return pd.DataFrame(columns=OHLCV_COLUMNS)
+
+    df = pd.DataFrame(
+        {
+            "date": [pd.Timestamp(e["t"], unit="ms", tz=timezone.utc) for e in raw_entries],
+            "open": [float(e["fundingRate"]) for e in raw_entries],
+            "high": 0.0,
+            "low": 0.0,
+            "close": 0.0,
+            "volume": 0.0,
+        }
+    )
+    return df[OHLCV_COLUMNS]
+
+
+def validate_funding_rate(df: pd.DataFrame) -> ValidationResult:
+    """Validate a funding-rate frame: duplicate timestamps, chronological
+    order, and numeric validity of the funding-rate value (``open``).
+
+    Deliberately does NOT reuse ``validate_ohlcv``: that function's
+    "non-positive price" and "invalid OHLC relationship" checks are correct
+    for real candles but wrong here -- funding rates are legitimately
+    negative or zero, and high/low/close/volume are always 0.0 by
+    construction (see ``funding_rate_to_dataframe``), not a data defect.
+    Spacing is reported as an observation (min/max/median gap), not a
+    pass/fail against a fixed expected interval -- real Hyperliquid funding
+    history is not uniformly 1h-spaced throughout its full history (verified
+    live; see the module-level note above), so hard-failing on that would
+    reject genuine data, not catch a real problem.
+    """
+    issues: list[str] = []
+
+    if df.empty:
+        return ValidationResult(ok=False, issues=["dataframe is empty"])
+
+    if df["date"].duplicated().any():
+        dupes = int(df["date"].duplicated().sum())
+        issues.append(f"{dupes} duplicate timestamp(s)")
+
+    if not df["date"].is_monotonic_increasing:
+        issues.append("timestamps are not strictly chronological")
+
+    non_finite = ~df["open"].apply(math.isfinite)
+    if non_finite.any():
+        issues.append(f"{int(non_finite.sum())} row(s) with non-finite funding rate value")
+
+    return ValidationResult(ok=not issues, issues=issues)
+
+
+def run_funding_pipeline(
+    *,
+    coin: str,
+    start_ms: int,
+    end_ms: int,
+    pair: str,
+    datadir: Path,
+    request_window_ms: int,
+    fetch: FetchFn = fetch_funding_rate_snapshot,
+) -> PipelineResult:
+    """The funding-rate analogue of ``run_pipeline``: Hyperliquid
+    fundingHistory API -> historical funding rates -> Freqtrade's
+    ``CandleType.FUNDING_RATE`` data format -> Freqtrade can read the data.
+
+    ``request_window_ms`` has no default here (unlike ``run_pipeline``'s
+    optional one): fundingHistory's real per-request cap is 500 entries
+    (verified live, not assumed -- see
+    ``HYPERLIQUID_FUNDING_HISTORY_REQUEST_CAP``), so silently requesting
+    the full range in one call risks a silent truncation that
+    ``run_pipeline``'s "full range in one request" default would hide.
+    Callers must choose a window they know is safely under the real cap
+    for the data's actual density.
+    """
+    try:
+        pagination = paginate_raw(
+            coin, "funding_rate", start_ms, end_ms, request_window_ms=request_window_ms, fetch=fetch
+        )
+        api_ok = True
+    except HyperliquidAPIError:
+        return PipelineResult(
+            api_ok=False,
+            download_ok=False,
+            pagination_requests=0,
+            dedup_removed=0,
+            validation=ValidationResult(ok=False, issues=["API call(s) failed"]),
+            freqtrade_format_ok=False,
+            freqtrade_readback_ok=False,
+            candle_count=0,
+            first_date=None,
+            last_date=None,
+            output_path=None,
+        )
+
+    raw = dedupe_and_sort(pagination.raw_candles)
+    dedup_removed = len(pagination.raw_candles) - len(raw)
+    df = funding_rate_to_dataframe(raw)
+    validation = validate_funding_rate(df)
+
+    output_path = None
+    freqtrade_format_ok = False
+    freqtrade_readback_ok = False
+    if validation.ok:
+        output_path = save_to_freqtrade(
+            df, datadir=datadir, pair=pair, timeframe="1h", candle_type="funding_rate"
+        )
+        freqtrade_format_ok = output_path.exists()
+        if freqtrade_format_ok:
+            read_back = read_back_from_freqtrade(
+                datadir=datadir, pair=pair, timeframe="1h", candle_type="funding_rate"
             )
             freqtrade_readback_ok = len(read_back) == len(df) and list(read_back.columns) == OHLCV_COLUMNS
 

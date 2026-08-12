@@ -21,11 +21,15 @@ from research.hyperliquid_ohlcv import (
     dedupe_and_sort,
     default_window_for,
     fetch_candle_snapshot,
+    fetch_funding_rate_snapshot,
+    funding_rate_to_dataframe,
     interval_to_ms,
     paginate_candles,
     paginate_raw,
+    run_funding_pipeline,
     run_pipeline_matrix,
     to_dataframe,
+    validate_funding_rate,
     validate_ohlcv,
 )
 
@@ -359,3 +363,211 @@ class TestRunPipelineMatrix:
         assert results[("BTC", "5m")].api_ok is True
         assert results[("BTC", "1h")].api_ok is True
         assert results[("ETH", "5m")].api_ok is True
+
+
+def make_funding_entry(t: int, *, coin: str = "BTC", funding_rate: float = 0.0001, premium: float = 0.0002):
+    return {"coin": coin, "fundingRate": str(funding_rate), "premium": str(premium), "time": t, "t": t}
+
+
+ONE_HOUR_MS = 3_600_000
+
+
+class TestFetchFundingRateSnapshotMalformedResponses:
+    def _mock_response(self, body: bytes, status: int = 200):
+        cm = MagicMock()
+        cm.__enter__.return_value = cm
+        cm.status = status
+        cm.read.return_value = body
+        return cm
+
+    def test_valid_response_gets_a_t_key_added(self):
+        entries = [{"coin": "BTC", "fundingRate": "0.0001", "premium": "0.0002", "time": 999}]
+        with patch("research.hyperliquid_ohlcv.urllib.request.urlopen") as mock_urlopen:
+            mock_urlopen.return_value = self._mock_response(json.dumps(entries).encode())
+            result = fetch_funding_rate_snapshot("BTC", "funding_rate", 0, 1000)
+        assert result == [{**entries[0], "t": 999}]
+
+    def test_non_list_json_response_raises(self):
+        with patch("research.hyperliquid_ohlcv.urllib.request.urlopen") as mock_urlopen:
+            mock_urlopen.return_value = self._mock_response(json.dumps({"error": "bad coin"}).encode())
+            with pytest.raises(HyperliquidAPIError, match="expected a JSON list"):
+                fetch_funding_rate_snapshot("BTC", "funding_rate", 0, 1000)
+
+    def test_invalid_json_raises(self):
+        with patch("research.hyperliquid_ohlcv.urllib.request.urlopen") as mock_urlopen:
+            mock_urlopen.return_value = self._mock_response(b"not json")
+            with pytest.raises(HyperliquidAPIError, match="not valid JSON"):
+                fetch_funding_rate_snapshot("BTC", "funding_rate", 0, 1000)
+
+    def test_non_200_status_raises(self):
+        with patch("research.hyperliquid_ohlcv.urllib.request.urlopen") as mock_urlopen:
+            mock_urlopen.return_value = self._mock_response(b"[]", status=500)
+            with pytest.raises(HyperliquidAPIError, match="unexpected HTTP status"):
+                fetch_funding_rate_snapshot("BTC", "funding_rate", 0, 1000)
+
+    def test_entry_missing_time_field_raises(self):
+        entries = [{"coin": "BTC", "fundingRate": "0.0001", "premium": "0.0002"}]
+        with patch("research.hyperliquid_ohlcv.urllib.request.urlopen") as mock_urlopen:
+            mock_urlopen.return_value = self._mock_response(json.dumps(entries).encode())
+            with pytest.raises(HyperliquidAPIError, match="missing 'time' field"):
+                fetch_funding_rate_snapshot("BTC", "funding_rate", 0, 1000)
+
+
+class TestFundingRateToDataframe:
+    def test_maps_funding_rate_to_open_and_zeros_the_rest(self):
+        entries = [make_funding_entry(0, funding_rate=-0.0005)]
+        df = funding_rate_to_dataframe(entries)
+        assert list(df.columns) == ["date", "open", "high", "low", "close", "volume"]
+        row = df.iloc[0]
+        assert row["open"] == pytest.approx(-0.0005)
+        assert row["high"] == 0.0
+        assert row["low"] == 0.0
+        assert row["close"] == 0.0
+        assert row["volume"] == 0.0
+
+    def test_negative_and_zero_funding_rates_pass_through_unmodified(self):
+        entries = [
+            make_funding_entry(0, funding_rate=0.0),
+            make_funding_entry(ONE_HOUR_MS, funding_rate=-0.0012345),
+        ]
+        df = funding_rate_to_dataframe(entries)
+        assert df["open"].tolist() == pytest.approx([0.0, -0.0012345])
+
+    def test_empty_input(self):
+        df = funding_rate_to_dataframe([])
+        assert df.empty
+        assert list(df.columns) == ["date", "open", "high", "low", "close", "volume"]
+
+
+class TestValidateFundingRate:
+    def test_valid_data_passes(self):
+        entries = [make_funding_entry(i * ONE_HOUR_MS) for i in range(5)]
+        result = validate_funding_rate(funding_rate_to_dataframe(entries))
+        assert result.ok is True
+        assert result.issues == []
+
+    def test_empty_dataframe_fails(self):
+        result = validate_funding_rate(funding_rate_to_dataframe([]))
+        assert result.ok is False
+        assert "empty" in result.issues[0]
+
+    def test_negative_funding_rate_is_not_a_validation_error(self):
+        """Unlike validate_ohlcv's non-positive-price check, funding rates
+        are legitimately negative -- this must NOT be flagged."""
+        entries = [make_funding_entry(0, funding_rate=-0.01)]
+        result = validate_funding_rate(funding_rate_to_dataframe(entries))
+        assert result.ok is True
+
+    def test_zero_high_low_close_volume_is_not_a_validation_error(self):
+        """Unlike validate_ohlcv's OHLC-relationship check, high=low=close=
+        volume=0 is the correct, expected shape here -- must NOT be flagged."""
+        entries = [make_funding_entry(0)]
+        df = funding_rate_to_dataframe(entries)
+        assert (df[["high", "low", "close", "volume"]] == 0.0).all().all()
+        result = validate_funding_rate(df)
+        assert result.ok is True
+
+    def test_detects_duplicate_timestamps(self):
+        entries = [make_funding_entry(0), make_funding_entry(0)]
+        df = pd.concat(
+            [funding_rate_to_dataframe([entries[0]]), funding_rate_to_dataframe([entries[1]])],
+            ignore_index=True,
+        )
+        result = validate_funding_rate(df)
+        assert result.ok is False
+        assert any("duplicate timestamp" in issue for issue in result.issues)
+
+    def test_detects_non_chronological_order(self):
+        entries = [make_funding_entry(i * ONE_HOUR_MS) for i in range(3)]
+        df = funding_rate_to_dataframe(entries).iloc[::-1].reset_index(drop=True)
+        result = validate_funding_rate(df)
+        assert result.ok is False
+        assert any("chronological" in issue for issue in result.issues)
+
+    def test_detects_non_finite_funding_rate(self):
+        entries = [make_funding_entry(0)]
+        df = funding_rate_to_dataframe(entries)
+        df.loc[0, "open"] = float("nan")
+        result = validate_funding_rate(df)
+        assert result.ok is False
+        assert any("non-finite" in issue for issue in result.issues)
+
+    def test_irregular_spacing_is_not_flagged_as_invalid(self):
+        """Real Hyperliquid funding history is not uniformly spaced
+        throughout its history (verified live -- see module docstring);
+        validate_funding_rate must not hard-fail on irregular gaps."""
+        entries = [make_funding_entry(0), make_funding_entry(ONE_HOUR_MS), make_funding_entry(5 * ONE_HOUR_MS)]
+        result = validate_funding_rate(funding_rate_to_dataframe(entries))
+        assert result.ok is True
+
+
+class TestRunFundingPipeline:
+    def _synthetic_fetch(self, coin, interval, start_ms, end_ms):
+        step = ONE_HOUR_MS
+        first = ((start_ms + step - 1) // step) * step
+        out = []
+        t = first
+        while t <= end_ms:
+            out.append(make_funding_entry(t, coin=coin, funding_rate=0.0001 * ((t // step) % 3 - 1)))
+            t += step
+        return out
+
+    def test_end_to_end_with_pagination_and_dedup(self, tmp_path):
+        result = run_funding_pipeline(
+            coin="BTC",
+            start_ms=0,
+            end_ms=10 * ONE_HOUR_MS,
+            pair="BTC/USDC:USDC",
+            datadir=tmp_path,
+            request_window_ms=3 * ONE_HOUR_MS,
+            fetch=self._synthetic_fetch,
+        )
+        assert result.api_ok is True
+        assert result.download_ok is True
+        assert result.pagination_requests > 1
+        assert result.validation.ok is True
+        assert result.freqtrade_format_ok is True
+        assert result.freqtrade_readback_ok is True
+        assert result.candle_count == 11
+
+    def test_writes_to_funding_rate_candle_type_path(self, tmp_path):
+        result = run_funding_pipeline(
+            coin="ETH",
+            start_ms=0,
+            end_ms=5 * ONE_HOUR_MS,
+            pair="ETH/USDC:USDC",
+            datadir=tmp_path,
+            request_window_ms=2 * ONE_HOUR_MS,
+            fetch=self._synthetic_fetch,
+        )
+        assert result.output_path is not None
+        assert "funding_rate" in result.output_path.name
+        assert result.output_path.exists()
+
+    def test_api_failure_reported_without_writing_a_file(self, tmp_path):
+        def failing_fetch(coin, interval, start_ms, end_ms):
+            raise HyperliquidAPIError("simulated failure")
+
+        result = run_funding_pipeline(
+            coin="BTC",
+            start_ms=0,
+            end_ms=5 * ONE_HOUR_MS,
+            pair="BTC/USDC:USDC",
+            datadir=tmp_path,
+            request_window_ms=2 * ONE_HOUR_MS,
+            fetch=failing_fetch,
+        )
+        assert result.api_ok is False
+        assert result.output_path is None
+        assert not any(tmp_path.rglob("*.feather"))
+
+    def test_distinct_pairs_write_distinct_files(self, tmp_path):
+        btc = run_funding_pipeline(
+            coin="BTC", start_ms=0, end_ms=5 * ONE_HOUR_MS, pair="BTC/USDC:USDC",
+            datadir=tmp_path, request_window_ms=2 * ONE_HOUR_MS, fetch=self._synthetic_fetch,
+        )
+        eth = run_funding_pipeline(
+            coin="ETH", start_ms=0, end_ms=5 * ONE_HOUR_MS, pair="ETH/USDC:USDC",
+            datadir=tmp_path, request_window_ms=2 * ONE_HOUR_MS, fetch=self._synthetic_fetch,
+        )
+        assert btc.output_path != eth.output_path
