@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -334,3 +335,190 @@ def test_render_includes_aggregate_totals(tmp_path: Path) -> None:
     assert "LOSERS: 1" in rendered
     assert "LONG TRADES: 1" in rendered
     assert "SHORT TRADES: 1" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Native Freqtrade `.zip` export (real schema: freqtrade 2026.7,
+# freqtrade/optimize/optimize_reports/bt_storage.py store_backtest_results)
+# ---------------------------------------------------------------------------
+
+
+def _write_freqtrade_zip(
+    tmp_path: Path,
+    stem: str,
+    payload: dict | list,
+    *,
+    extra_members: dict[str, bytes] | None = None,
+) -> Path:
+    """Build a zip matching Freqtrade's own on-disk shape: `<stem>.zip`
+    containing `<stem>.json` (the stats payload) plus whatever other
+    members a real export also carries (sanitized config copy, etc.),
+    which this module must never open."""
+    zip_path = tmp_path / f"{stem}.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr(f"{stem}.json", json.dumps(payload))
+        for name, content in (extra_members or {}).items():
+            archive.writestr(name, content)
+    return zip_path
+
+
+_WRAPPED_PAYLOAD = {
+    "strategy": {"TrendFollowCore": {"trades": [_LONG_WIN, _SHORT_LOSS]}},
+    "strategy_comparison": [{"key": "TrendFollowCore", "trades": 2}],
+}
+
+
+def test_zip_json_member_name_matches_freqtrade_convention(tmp_path: Path) -> None:
+    from hermes.trade_report import _zip_json_member_name
+
+    zip_path = tmp_path / "backtest-result-2026-08-12_15-11-31.zip"
+    assert _zip_json_member_name(zip_path) == "backtest-result-2026-08-12_15-11-31.json"
+
+
+def test_load_zip_export_reads_wrapped_shape(tmp_path: Path) -> None:
+    zip_path = _write_freqtrade_zip(
+        tmp_path,
+        "backtest-result-2026-08-12_15-11-31",
+        _WRAPPED_PAYLOAD,
+        extra_members={"backtest-result-2026-08-12_15-11-31_config.json": b"{}"},
+    )
+
+    report = load_trades_export(zip_path, strategy="TrendFollowCore")
+
+    assert report.total_trades == 2
+    assert report.source_path == zip_path
+    assert {t.pair for t in report.trades} == {"BTC/USDC:USDC", "SOL/USDC:USDC"}
+
+
+def test_load_zip_export_reads_flat_list_shape(tmp_path: Path) -> None:
+    zip_path = _write_freqtrade_zip(tmp_path, "backtest-result-flat", [_LONG_WIN])
+
+    report = load_trades_export(zip_path)
+
+    assert report.total_trades == 1
+    assert report.trades[0].pair == "BTC/USDC:USDC"
+
+
+def test_zip_and_json_produce_equivalent_trade_records(tmp_path: Path) -> None:
+    json_path = tmp_path / "export.json"
+    json_path.write_text(json.dumps(_WRAPPED_PAYLOAD))
+    zip_path = _write_freqtrade_zip(tmp_path, "backtest-result-equiv", _WRAPPED_PAYLOAD)
+
+    json_report = load_trades_export(json_path, strategy="TrendFollowCore")
+    zip_report = load_trades_export(zip_path, strategy="TrendFollowCore")
+
+    assert json_report.trades == zip_report.trades
+
+
+def test_load_zip_export_ignores_other_zip_members_and_extracts_nothing_to_disk(
+    tmp_path: Path,
+) -> None:
+    """A crafted member name elsewhere in the archive (including one that
+    looks like a path-traversal attempt) must never be opened or written
+    anywhere -- this module only ever reads the one member name it itself
+    computes."""
+    before = set(tmp_path.iterdir())
+    zip_path = _write_freqtrade_zip(
+        tmp_path,
+        "backtest-result-traversal",
+        _WRAPPED_PAYLOAD,
+        extra_members={
+            "backtest-result-traversal_config.json": b"{}",
+            "../../../../tmp/evil_hermes_test_marker.json": b"malicious",
+        },
+    )
+
+    report = load_trades_export(zip_path, strategy="TrendFollowCore")
+
+    assert report.total_trades == 2
+    # Nothing was extracted: the only new filesystem entry is the zip itself.
+    after = set(tmp_path.iterdir())
+    assert after - before == {zip_path}
+    assert not (Path("/tmp") / "evil_hermes_test_marker.json").exists()
+
+
+def test_load_zip_export_missing_expected_member_raises(tmp_path: Path) -> None:
+    zip_path = tmp_path / "backtest-result-orphan.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("something-else.json", json.dumps(_WRAPPED_PAYLOAD))
+
+    with pytest.raises(TradeReportError, match="not found"):
+        load_trades_export(zip_path)
+
+
+def test_load_zip_export_malformed_zip_raises(tmp_path: Path) -> None:
+    zip_path = tmp_path / "backtest-result-broken.zip"
+    zip_path.write_bytes(b"this is not a zip file")
+
+    with pytest.raises(TradeReportError, match="not a valid zip"):
+        load_trades_export(zip_path)
+
+
+def test_load_zip_export_malformed_json_inside_zip_raises(tmp_path: Path) -> None:
+    zip_path = tmp_path / "backtest-result-badjson.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("backtest-result-badjson.json", "not json{{{")
+
+    with pytest.raises(TradeReportError, match="cannot read export file"):
+        load_trades_export(zip_path)
+
+
+def test_load_zip_export_missing_file_raises(tmp_path: Path) -> None:
+    with pytest.raises(TradeReportError, match="cannot read export file"):
+        load_trades_export(tmp_path / "does_not_exist.zip")
+
+
+# ---------------------------------------------------------------------------
+# find_latest_export_file: `.last_result.json` pointer + `.zip` support
+# ---------------------------------------------------------------------------
+
+
+def test_find_latest_export_file_prefers_last_result_pointer(tmp_path: Path) -> None:
+    import os
+    import time
+
+    older = _write_freqtrade_zip(tmp_path, "backtest-result-2026-01-01_00-00-00", _WRAPPED_PAYLOAD)
+    newer = _write_freqtrade_zip(tmp_path, "backtest-result-2026-02-01_00-00-00", _WRAPPED_PAYLOAD)
+    os.utime(older, (time.time() - 100, time.time() - 100))
+    # Pointer explicitly names the OLDER file -- proves the pointer wins over mtime.
+    (tmp_path / ".last_result.json").write_text(
+        json.dumps({"latest_backtest": older.name})
+    )
+
+    assert find_latest_export_file(tmp_path) == older
+
+
+def test_find_latest_export_file_falls_back_when_pointer_invalid(tmp_path: Path) -> None:
+    zip_path = _write_freqtrade_zip(tmp_path, "backtest-result-only", _WRAPPED_PAYLOAD)
+    (tmp_path / ".last_result.json").write_text("not json{{{")
+
+    assert find_latest_export_file(tmp_path) == zip_path
+
+
+def test_find_latest_export_file_falls_back_when_pointer_points_to_missing_file(
+    tmp_path: Path,
+) -> None:
+    zip_path = _write_freqtrade_zip(tmp_path, "backtest-result-only", _WRAPPED_PAYLOAD)
+    (tmp_path / ".last_result.json").write_text(
+        json.dumps({"latest_backtest": "backtest-result-does-not-exist.zip"})
+    )
+
+    assert find_latest_export_file(tmp_path) == zip_path
+
+
+def test_find_latest_export_file_finds_zip_via_glob_without_pointer(tmp_path: Path) -> None:
+    import os
+    import time
+
+    older = _write_freqtrade_zip(tmp_path, "backtest-result-2026-01-01_00-00-00", _WRAPPED_PAYLOAD)
+    newer = _write_freqtrade_zip(tmp_path, "backtest-result-2026-02-01_00-00-00", _WRAPPED_PAYLOAD)
+    os.utime(older, (time.time() - 100, time.time() - 100))
+
+    assert find_latest_export_file(tmp_path) == newer
+
+
+def test_find_latest_export_file_still_ignores_meta_json_alongside_zip(tmp_path: Path) -> None:
+    zip_path = _write_freqtrade_zip(tmp_path, "backtest-result-x", _WRAPPED_PAYLOAD)
+    (tmp_path / "backtest-result-x.meta.json").write_text("{}")
+
+    assert find_latest_export_file(tmp_path) == zip_path
