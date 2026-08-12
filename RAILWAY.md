@@ -263,6 +263,19 @@ deploy existed), this has now actually been deployed and exercised:
   --strategy-path user_data/strategies` — `--strategy`/`--strategy-path`
   are `backtesting`-only flags, not accepted by `download-data`. Fixed
   by dropping them from the start command for that run.
+- **Hermes memory is on ephemeral storage, not the Volume** (found while
+  trying to read a completed backtest's results back; **not fixed** —
+  recorded here as a known limitation). The Volume is mounted at
+  `/app/user_data/data`, but `MemoryStore`'s default path is
+  `user_data/hermes_memory.sqlite3` → `/app/user_data/hermes_memory.sqlite3`,
+  which sits *beside* the mount point rather than inside it. Every
+  container therefore starts with an empty history and loses whatever
+  it recorded when it exits, so a backtest's persisted result cannot be
+  read back by any later deployment. Two ways out, neither applied here:
+  point `hermes backtest --user-data-dir` at a directory inside the
+  Volume, or move the Volume's mount path up to `/app/user_data` (which
+  would re-introduce the shadowing problem described above unless the
+  baked-in config/strategy files are relocated first).
 - **Binance USD-M futures reachability**: confirmed *blocked* — real
   HTTP `451` from `fapi.binance.com`, a Binance-side geo-restriction on
   Railway's deployed region (see "Why Hyperliquid is primary" above).
