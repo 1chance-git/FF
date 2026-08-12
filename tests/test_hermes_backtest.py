@@ -350,3 +350,141 @@ def test_launcher_still_raises_on_timeout_with_memory_store_configured(
         BacktestLauncher(memory_store=memory_store).run(config, timeout_seconds=1)
 
     assert memory_store.get_backtest_results() == []
+
+
+# ---------------------------------------------------------------------------
+# Trade/signal export plumbing (observational only; hermes.export_paths)
+# ---------------------------------------------------------------------------
+
+
+def test_config_rejects_export_directory_without_export_type() -> None:
+    with pytest.raises(BacktestError, match="export_type"):
+        BacktestConfig(
+            strategy="Foo",
+            config_files=(Path("a.json"),),
+            export_directory=Path("/tmp/whatever"),
+        )
+
+
+def test_config_rejects_invalid_export_type() -> None:
+    with pytest.raises(BacktestError, match="export_type"):
+        BacktestConfig(
+            strategy="Foo",
+            config_files=(Path("a.json"),),
+            export_type="bogus",
+        )
+
+
+def test_build_backtest_command_includes_export_flags() -> None:
+    config = BacktestConfig(
+        strategy="Foo",
+        config_files=(Path("a.json"),),
+        export_type="trades",
+        export_directory=Path("/persistent/backtest_results"),
+    )
+    command = build_backtest_command(config)
+
+    assert "--export" in command
+    export_index = command.index("--export")
+    assert command[export_index + 1] == "trades"
+    assert "--export-directory" in command
+    assert "/persistent/backtest_results" in command
+
+
+def test_build_backtest_command_omits_export_flags_when_unset() -> None:
+    config = BacktestConfig(strategy="Foo", config_files=(Path("a.json"),))
+    command = build_backtest_command(config)
+    assert "--export" not in command
+    assert "--export-directory" not in command
+
+
+def test_launcher_refuses_export_directory_without_persistent_root_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_subprocess_run(monkeypatch, returncode=0, stdout="ok")
+    config = BacktestConfig(
+        strategy="Foo",
+        config_files=(Path("a.json"),),
+        export_type="trades",
+        export_directory=tmp_path / "backtest_results",
+    )
+    launcher = BacktestLauncher()  # export_persistent_root omitted
+
+    with pytest.raises(BacktestError, match="export_persistent_root"):
+        launcher.run(config)
+
+
+def test_launcher_refuses_export_directory_outside_persistent_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_subprocess_run(monkeypatch, returncode=0, stdout="ok")
+    root = tmp_path / "volume"
+    root.mkdir()
+    outside = tmp_path / "ephemeral" / "backtest_results"
+    config = BacktestConfig(
+        strategy="Foo",
+        config_files=(Path("a.json"),),
+        export_type="trades",
+        export_directory=outside,
+    )
+    launcher = BacktestLauncher(export_persistent_root=root)
+
+    with pytest.raises(BacktestError, match="invalid export directory"):
+        launcher.run(config)
+
+    assert not outside.exists()
+
+
+def test_launcher_creates_valid_export_directory_before_launching(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_subprocess_run(monkeypatch, returncode=0, stdout="ok")
+    export_dir = tmp_path / "backtest_results"
+    config = BacktestConfig(
+        strategy="Foo",
+        config_files=(Path("a.json"),),
+        export_type="trades",
+        export_directory=export_dir,
+    )
+    launcher = BacktestLauncher(export_persistent_root=tmp_path)
+
+    result = launcher.run(config)
+
+    assert result.succeeded is True
+    assert export_dir.is_dir()
+
+
+def test_export_metadata_is_persisted_in_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_subprocess_run(monkeypatch, returncode=0, stdout="ok")
+    memory_store = MemoryStore(tmp_path / "memory.sqlite3")
+    export_dir = tmp_path / "backtest_results"
+    config = BacktestConfig(
+        strategy="Foo",
+        config_files=(Path("a.json"),),
+        export_type="signals",
+        export_directory=export_dir,
+    )
+    launcher = BacktestLauncher(memory_store=memory_store, export_persistent_root=tmp_path)
+
+    launcher.run(config)
+
+    [saved] = memory_store.get_backtest_results()
+    assert saved.metrics["export_type"] == "signals"
+    assert saved.metrics["export_directory"] == str(export_dir)
+
+
+def test_export_metadata_defaults_to_none_when_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_subprocess_run(monkeypatch, returncode=0, stdout="ok")
+    memory_store = MemoryStore(tmp_path / "memory.sqlite3")
+    config = BacktestConfig(strategy="Foo", config_files=(Path("a.json"),))
+    launcher = BacktestLauncher(memory_store=memory_store)
+
+    launcher.run(config)
+
+    [saved] = memory_store.get_backtest_results()
+    assert saved.metrics["export_type"] is None
+    assert saved.metrics["export_directory"] is None
