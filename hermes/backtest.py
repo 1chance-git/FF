@@ -56,6 +56,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from hermes.export_paths import ExportPathError, prepare_export_directory
 from hermes.memory import BacktestResult as MemoryBacktestResult
 from hermes.memory import MemoryStore
 
@@ -89,6 +90,27 @@ class BacktestConfig:
         Additional raw CLI arguments appended verbatim (escape hatch for
         flags this dataclass doesn't model explicitly, e.g.
         ``["--breakdown", "day"]``).
+    export_type:
+        Optional Freqtrade ``--export`` artifact type to request: one of
+        ``"trades"``, ``"signals"``, or ``"none"`` -- the installed
+        Freqtrade version's ``backtesting`` subcommand accepts exactly
+        one of these (confirmed via ``freqtrade backtesting --help``; it
+        is not a repeatable/multi-value flag). Passing this without
+        ``export_directory`` still lets Freqtrade choose its own
+        (unvalidated, likely-ephemeral) default location -- pair it with
+        ``export_directory`` to guarantee the artifact lands somewhere
+        proven persistent.
+    export_directory:
+        Optional directory Freqtrade should write the requested export
+        artifact to (passed as ``--export-directory``, the installed
+        version's non-deprecated flag for this -- ``--export-filename``/
+        ``--backtest-filename`` is deprecated and names a *file*, not a
+        directory). Purely observational: this instructs Freqtrade to
+        *additionally* persist data it already computes internally, and
+        changes nothing about which trades the strategy takes or how
+        they're evaluated. :func:`hermes.export_paths.prepare_export_directory`
+        validates this is actually inside proven-persistent storage
+        before the backtest is launched -- see :meth:`BacktestLauncher.run`.
     """
 
     strategy: str
@@ -97,12 +119,25 @@ class BacktestConfig:
     timeframe: str | None = None
     strategy_path: Path | None = None
     extra_args: tuple[str, ...] = field(default_factory=tuple)
+    export_type: str | None = None
+    export_directory: Path | None = None
+
+    _VALID_EXPORT_TYPES = ("none", "trades", "signals")
 
     def __post_init__(self) -> None:
         if not self.strategy:
             raise BacktestError("strategy must be a non-empty string")
         if not self.config_files:
             raise BacktestError("config_files must contain at least one path")
+        if self.export_type is not None and self.export_type not in self._VALID_EXPORT_TYPES:
+            raise BacktestError(
+                f"export_type must be one of {self._VALID_EXPORT_TYPES}, got: {self.export_type!r}"
+            )
+        if self.export_directory is not None and self.export_type is None:
+            raise BacktestError(
+                "export_directory was given but export_type is unset; "
+                "specify what to export (e.g. 'trades')"
+            )
 
 
 @dataclass(frozen=True)
@@ -166,6 +201,11 @@ def build_backtest_command(config: BacktestConfig) -> list[str]:
     if config.timeframe is not None:
         command += ["--timeframe", config.timeframe]
 
+    if config.export_type is not None:
+        command += ["--export", config.export_type]
+    if config.export_directory is not None:
+        command += ["--export-directory", str(config.export_directory)]
+
     command += list(config.extra_args)
     return command
 
@@ -173,7 +213,12 @@ def build_backtest_command(config: BacktestConfig) -> list[str]:
 class BacktestLauncher:
     """Launches `freqtrade backtesting` as a subprocess and reports the outcome."""
 
-    def __init__(self, memory_store: MemoryStore | None = None) -> None:
+    def __init__(
+        self,
+        memory_store: MemoryStore | None = None,
+        *,
+        export_persistent_root: Path | None = None,
+    ) -> None:
         """Initialize the launcher.
 
         Parameters
@@ -182,8 +227,37 @@ class BacktestLauncher:
             Optional `hermes.memory.MemoryStore` to persist each
             completed run's result to. Omit to run with no persistence
             (e.g. existing callers, or tests that don't care about it).
+        export_persistent_root:
+            The proven-persistent directory any `BacktestConfig.export_directory`
+            must live inside (see `hermes.export_paths`). Required only
+            if a config passed to :meth:`run` sets `export_directory`;
+            omitted entirely, this launcher behaves exactly as it did
+            before trade-export support existed.
         """
         self.memory_store = memory_store
+        self.export_persistent_root = export_persistent_root
+
+    def _preflight_export_directory(self, export_directory: Path) -> Path:
+        """Validate `export_directory` before any subprocess is launched.
+
+        Raises `BacktestError` (never launching a backtest) if the
+        directory can't be proven both inside persistent storage and
+        writable -- fail-safe, per this launcher's contract of never
+        raising *from* a completed backtest but always raising on its
+        own invalid configuration.
+        """
+        if self.export_persistent_root is None:
+            raise BacktestError(
+                "config.export_directory was set, but this BacktestLauncher "
+                "was constructed without export_persistent_root; refusing "
+                "to guess where persistent storage is"
+            )
+        try:
+            return prepare_export_directory(
+                export_directory, persistent_root=self.export_persistent_root
+            )
+        except ExportPathError as exc:
+            raise BacktestError(f"invalid export directory: {exc}") from exc
 
     def run(self, config: BacktestConfig, timeout_seconds: float | None = None) -> BacktestResult:
         """Run a backtest and return its result.
@@ -207,6 +281,9 @@ class BacktestLauncher:
         BacktestError
             If the process times out.
         """
+        if config.export_directory is not None:
+            self._preflight_export_directory(config.export_directory)
+
         command = build_backtest_command(config)
         logger.info("Launching backtest: %s", " ".join(command))
 
@@ -268,6 +345,8 @@ class BacktestLauncher:
             "timeframe": config.timeframe,
             "strategy_path": str(config.strategy_path) if config.strategy_path else None,
             "extra_args": list(config.extra_args),
+            "export_type": config.export_type,
+            "export_directory": str(config.export_directory) if config.export_directory else None,
         }
 
         try:

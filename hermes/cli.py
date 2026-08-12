@@ -19,6 +19,9 @@ Commands
 * ``hermes backtest-report`` — read-only report of an *already recorded*
   backtest's Freqtrade results, via :mod:`hermes.backtest_report`. Never
   runs a backtest; it only reads what a previous run already persisted.
+* ``hermes trade-report`` — read-only, per-trade report over a prior
+  ``hermes backtest --export trades ...`` run's native Freqtrade export
+  file, via :mod:`hermes.trade_report`. Never runs a backtest.
 * ``hermes start`` / ``stop`` / ``restart`` / ``status`` — process
   lifecycle via :mod:`hermes.process`.
 """
@@ -40,12 +43,19 @@ from hermes.backtest_report import (
     extract_stdout,
     parse_backtest_stdout,
 )
+from hermes.export_paths import default_export_directory
 from hermes.health import HealthChecker, HealthStatus
 from hermes.logging_config import LoggingConfig, configure_logging, get_logger
 from hermes.memory import DEFAULT_USER_DATA_DIR, USER_DATA_DIR_ENV_VAR
 from hermes.memory import BacktestResult as MemoryBacktestResult
 from hermes.memory import MemoryStore, memory_db_path
 from hermes.process import BotProcessManager, ProcessConfig
+from hermes.trade_report import (
+    TradeReportError,
+    find_latest_export_file,
+    load_trades_export,
+    render_trade_report,
+)
 
 logger = get_logger(__name__)
 console = Console()
@@ -154,6 +164,30 @@ def health(api_url: str, username: str | None, password: str | None) -> None:
         "storage instead (see RAILWAY.md)."
     ),
 )
+@click.option(
+    "--export",
+    "export_type",
+    default=None,
+    type=click.Choice(["none", "trades", "signals"]),
+    help=(
+        "Request Freqtrade's own trade/signal export. Purely observational: "
+        "changes nothing about which trades the strategy takes. Written to "
+        "--export-dir once validated as safely persistent."
+    ),
+)
+@click.option(
+    "--export-dir",
+    "export_directory",
+    default=None,
+    type=click.Path(path_type=Path),
+    help=(
+        "Directory to write the --export artifact to. Must resolve inside "
+        "the same persistent storage as hermes_memory.sqlite3 (validated "
+        "before the backtest is launched; see hermes.export_paths). "
+        "Defaults to <user-data-dir>/backtest_results if --export was given "
+        "but this wasn't."
+    ),
+)
 def backtest(
     config_files: tuple[Path, ...],
     strategy: str,
@@ -162,14 +196,23 @@ def backtest(
     strategy_path: Path | None,
     timeout: float | None,
     user_data_dir: Path | None,
+    export_type: str | None,
+    export_directory: Path | None,
 ) -> None:
     """Launch a Freqtrade backtest and print a summary."""
+    resolved_user_data_dir = user_data_dir if user_data_dir is not None else Path(DEFAULT_USER_DATA_DIR)
     bt_config = BacktestConfig(
         strategy=strategy,
         config_files=config_files,
         timerange=timerange,
         timeframe=timeframe,
         strategy_path=strategy_path,
+        export_type=export_type,
+        export_directory=(
+            export_directory
+            if export_directory is not None
+            else (default_export_directory(resolved_user_data_dir) if export_type else None)
+        ),
     )
 
     memory_store = None
@@ -182,7 +225,10 @@ def backtest(
         )
 
     console.print(f"[bold]Launching backtest[/bold] for strategy [cyan]{strategy}[/cyan]...")
-    result = BacktestLauncher(memory_store=memory_store).run(bt_config, timeout_seconds=timeout)
+    launcher_kwargs: dict[str, object] = {"memory_store": memory_store}
+    if export_type:
+        launcher_kwargs["export_persistent_root"] = resolved_user_data_dir
+    result = BacktestLauncher(**launcher_kwargs).run(bt_config, timeout_seconds=timeout)
 
     if result.succeeded:
         console.print(
@@ -489,6 +535,70 @@ def backtest_report(
         sys.exit(1)
 
     click.echo(render_backtest_report(record, parse_backtest_stdout(stdout)))
+
+
+@cli.command(name="trade-report")
+@click.option(
+    "--user-data-dir",
+    default=None,
+    envvar=USER_DATA_DIR_ENV_VAR,
+    show_envvar=True,
+    type=click.Path(path_type=Path),
+    help=(
+        "Directory holding hermes_memory.sqlite3 (used only to derive the "
+        "default export directory, <user-data-dir>/backtest_results; pass "
+        "--export-dir directly to override). Defaults to "
+        f"{DEFAULT_USER_DATA_DIR}; set {USER_DATA_DIR_ENV_VAR} to match a "
+        "prior `hermes backtest --export ...` run."
+    ),
+)
+@click.option(
+    "--export-dir",
+    "export_directory",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Directory a prior `hermes backtest --export ...` wrote its export file to.",
+)
+@click.option(
+    "--strategy",
+    default=None,
+    help="Which strategy's trades to read, if the export file recorded more than one.",
+)
+def trade_report(
+    user_data_dir: Path | None, export_directory: Path | None, strategy: str | None
+) -> None:
+    """Report per-trade detail from a prior `hermes backtest --export ...` run.
+
+    Strictly read-only: this command never launches a backtest and never
+    writes anything. It reads whatever Freqtrade's own trade export file
+    already contains -- reporting `N/A` for anything genuinely absent
+    rather than inferring or fabricating a value.
+    """
+    resolved_user_data_dir = user_data_dir if user_data_dir is not None else Path(DEFAULT_USER_DATA_DIR)
+    directory = (
+        export_directory
+        if export_directory is not None
+        else default_export_directory(resolved_user_data_dir)
+    )
+
+    export_file = find_latest_export_file(directory)
+    if export_file is None:
+        click.echo(
+            "[HERMES][TRADE-REPORT] No trade export file found under "
+            f"{directory}.\n\n"
+            "This means no `hermes backtest --export trades ...` run has "
+            "written an export to this directory yet. Nothing was launched "
+            "to check this."
+        )
+        sys.exit(1)
+
+    try:
+        report = load_trades_export(export_file, strategy=strategy)
+    except TradeReportError as exc:
+        click.echo(f"[HERMES][TRADE-REPORT][ERROR] {exc}")
+        sys.exit(1)
+
+    click.echo(render_trade_report(report))
 
 
 def _process_manager(config_files: tuple[Path, ...], strategy: str, pid_file: Path) -> BotProcessManager:
