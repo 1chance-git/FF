@@ -2,10 +2,16 @@
 
 Path A's first production-oriented strategy, distinct from and
 unrelated to :mod:`StatArbSwing` (the retained mean-reversion pairs
-strategy for Path B research). Trades three independent futures pairs
--- ``BTC/USDC:USDC``, ``ETH/USDC:USDC``, ``SOL/USDC:USDC`` -- each
-signaled purely from its own price action, with no cross-pair
-statistics (no hedge ratio, no spread, no z-score, no cointegration).
+strategy for Path B research). Trades two independent futures pairs
+-- ``BTC/USDC:USDC``, ``ETH/USDC:USDC`` -- each signaled purely from
+its own price action, with no cross-pair statistics (no hedge ratio,
+no spread, no z-score, no cointegration). SOL/USDC:USDC was part of
+the initial research universe but was excluded from the frozen
+trading universe after a BTC+ETH-vs-SOL isolation audit over the
+frozen 39-trade baseline showed BTC+ETH alone with a materially
+cleaner profile (higher win rate, higher profit factor, roughly half
+the stop-loss count) and SOL as a net drag on aggregate P/L; SOL is
+deferred, not permanently ruled out, pending a larger sample.
 
 Scope, deliberately narrow: this file implements indicators and
 preliminary entry/invalidation logic ONLY.
@@ -159,7 +165,7 @@ def compute_exit_signals(dataframe: pd.DataFrame) -> pd.DataFrame:
 
 
 class TrendFollowCore(IStrategy):
-    """Trend-following strategy for BTC/ETH/SOL futures: EMA-200 direction
+    """Trend-following strategy for BTC/ETH futures: EMA-200 direction
     filter, ADX-14 trend-strength gate, and a 20-candle Donchian breakout
     trigger. See the module docstring for full scope and rationale.
     """

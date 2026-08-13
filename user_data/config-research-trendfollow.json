@@ -1,11 +1,11 @@
 {
     "$schema": "https://schema.freqtrade.io/schema.json",
-    "//": "RESEARCH-ONLY config -- for backtesting TrendFollowCore (Path A) against Hyperliquid 4h history. Never used for live trading, never referenced by the live bot process (see user_data/config.json for that). Distinct from user_data/config-research.json / user_data/config-research-binance.json, which are scoped to StatArbSwing's two-leg BTC/ETH pair universe -- TrendFollowCore trades three independent pairs (BTC, ETH, SOL) with no cross-pair statistics, so it needs its own pair whitelist and timeframe (4h, not StatArbSwing's 5m) rather than overloading either existing research config.",
+    "//": "RESEARCH-ONLY config -- for backtesting TrendFollowCore (Path A) against Hyperliquid 4h history. Never used for live trading, never referenced by the live bot process (see user_data/config.json for that). Distinct from user_data/config-research.json / user_data/config-research-binance.json, which are scoped to StatArbSwing's two-leg BTC/ETH pair universe -- TrendFollowCore trades two independent pairs (BTC, ETH) with no cross-pair statistics, so it needs its own pair whitelist and timeframe (4h, not StatArbSwing's 5m) rather than overloading either existing research config. SOL/USDC:USDC was part of the initial research universe but was excluded from the frozen trading universe after a BTC+ETH-vs-SOL isolation audit; see TrendFollowCore.py's module docstring for the rationale. SOL is deferred, not permanently ruled out.",
 
     "trading_mode": "futures",
     "margin_mode": "isolated",
 
-    "max_open_trades": 3,
+    "max_open_trades": 2,
     "stake_currency": "USDC",
     "stake_amount": "unlimited",
     "tradable_balance_ratio": 0.99,
@@ -42,7 +42,7 @@
     },
 
     "exchange": {
-        "//": "Hyperliquid as a DATA SOURCE for research -- research backtests never place orders (dry_run is always true above, and hermes backtest never runs `freqtrade trade`), so this is safe to point at the live exchange without risk. Three independent pairs for TrendFollowCore, not StatArbSwing's two-leg pair. No walletAddress/privateKey needed: public OHLCV/market-metadata endpoints don't require authentication, and this config already has real, validated 4h history on disk (see RAILWAY.md's data-acquisition record) -- backtesting against it makes no network call at all.",
+        "//": "Hyperliquid as a DATA SOURCE for research -- research backtests never place orders (dry_run is always true above, and hermes backtest never runs `freqtrade trade`), so this is safe to point at the live exchange without risk. Two independent pairs for TrendFollowCore (BTC, ETH), not StatArbSwing's two-leg pair. SOL/USDC:USDC was in the original research universe but was excluded from the frozen trading universe -- see the top-of-file comment. No walletAddress/privateKey needed: public OHLCV/market-metadata endpoints don't require authentication, and this config already has real, validated 4h history on disk (see RAILWAY.md's data-acquisition record) -- backtesting against it makes no network call at all.",
         "name": "hyperliquid",
         "walletAddress": "",
         "privateKey": "",
@@ -50,8 +50,7 @@
         "ccxt_async_config": {},
         "pair_whitelist": [
             "BTC/USDC:USDC",
-            "ETH/USDC:USDC",
-            "SOL/USDC:USDC"
+            "ETH/USDC:USDC"
         ],
         "pair_blacklist": []
     },
