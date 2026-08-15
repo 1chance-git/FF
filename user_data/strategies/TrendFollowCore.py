@@ -13,6 +13,18 @@ cleaner profile (higher win rate, higher profit factor, roughly half
 the stop-loss count) and SOL as a net drag on aggregate P/L; SOL is
 deferred, not permanently ruled out, pending a larger sample.
 
+**SHORT-ONLY.** LONG entry and exit logic has been removed
+structurally, not gated behind a configuration flag: ``compute_entry_signals``
+never evaluates the long-side EMA/ADX/Donchian condition at all (there
+is no ``long_condition`` in the code), and ``compute_exit_signals``
+never evaluates the long-side EMA-200 invalidation. ``enter_long`` and
+``exit_long`` columns are still produced (Freqtrade requires them) but
+are unconditionally ``0`` -- there is no code path, under any market
+condition, that can set either to ``1``. The SHORT entry condition
+(``close < ema200`` and ``adx > 25`` and Donchian-lower breakout) and
+SHORT exit condition (EMA-200 invalidation) are unchanged from the
+long/short version of this file.
+
 Scope, deliberately narrow: this file implements indicators and
 preliminary entry/invalidation logic ONLY.
 
@@ -50,11 +62,10 @@ Design
   masked to ``0``/``False`` wherever any required indicator is NaN --
   making "no signal during warmup" a checked invariant of this file
   rather than an incidental consequence of NaN comparison semantics.
-* **The EMA-200 trend filter is also the sole invalidation.** A long
-  is invalidated the moment price closes back below EMA-200 (the same
-  condition that would have blocked a *new* long entry) -- and
-  symmetrically for shorts -- so entry and exit share one trend
-  definition rather than inventing a second one.
+* **The EMA-200 trend filter is also the sole invalidation.** A short
+  is invalidated the moment price closes back above EMA-200 (the same
+  condition that would have blocked a *new* short entry), so entry and
+  exit share one trend definition rather than inventing a second one.
 """
 
 from __future__ import annotations
@@ -110,23 +121,23 @@ def compute_indicators(
 
 
 def compute_entry_signals(dataframe: pd.DataFrame) -> pd.DataFrame:
-    """Add ``enter_long``/``enter_short`` (0/1) plus their ``enter_tag``.
+    """Add ``enter_short`` (0/1) plus its ``enter_tag``. SHORT-only, structurally.
 
-    Long requires all three: ``close > ema200``, ``adx > 25``, and the
-    close breaking above the previous-20-candle Donchian upper channel.
-    Short is the exact mirror below the lower channel. Any row missing
-    a required indicator (warmup/NaN) gets no signal, explicitly.
+    Short requires all three: ``close < ema200``, ``adx > 25``, and the
+    close breaking below the previous-20-candle Donchian lower channel
+    -- unchanged from the long/short version of this strategy. Any row
+    missing a required indicator (warmup/NaN) gets no signal,
+    explicitly.
+
+    ``enter_long`` is still produced (Freqtrade requires the column)
+    but is unconditionally ``0``: there is no long-side condition
+    computed anywhere in this function, so no code path can set it to
+    ``1`` under any market data.
     """
     df = dataframe.copy()
 
     valid = df[list(_REQUIRED_INDICATOR_COLUMNS)].notna().all(axis=1)
 
-    long_condition = (
-        valid
-        & (df["close"] > df["ema200"])
-        & (df["adx"] > ADX_THRESHOLD)
-        & (df["close"] > df["donchian_upper_prev"])
-    )
     short_condition = (
         valid
         & (df["close"] < df["ema200"])
@@ -134,26 +145,30 @@ def compute_entry_signals(dataframe: pd.DataFrame) -> pd.DataFrame:
         & (df["close"] < df["donchian_lower_prev"])
     )
 
-    df["enter_long"] = long_condition.astype(int)
+    df["enter_long"] = 0
     df["enter_short"] = short_condition.astype(int)
-    df.loc[long_condition, "enter_tag"] = "trend_long_donchian_breakout"
     df.loc[short_condition, "enter_tag"] = "trend_short_donchian_breakout"
 
     return df
 
 
 def compute_exit_signals(dataframe: pd.DataFrame) -> pd.DataFrame:
-    """Add ``exit_long``/``exit_short`` (0/1): the EMA-200 structural invalidation.
+    """Add ``exit_short`` (0/1): the EMA-200 structural invalidation. SHORT-only.
 
-    A long exits the moment price closes back below EMA-200; a short
-    exits the moment price closes back above it. NaN ``ema200`` (warmup)
-    produces no exit signal, explicitly, same as the entry side.
+    A short exits the moment price closes back above EMA-200 --
+    unchanged from the long/short version of this strategy. NaN
+    ``ema200`` (warmup) produces no exit signal, explicitly, same as
+    the entry side.
+
+    ``exit_long`` is still produced (Freqtrade requires the column)
+    but is unconditionally ``0``: there is no long-side condition
+    computed anywhere in this function.
     """
     df = dataframe.copy()
 
     valid = df["ema200"].notna()
 
-    df["exit_long"] = (valid & (df["close"] < df["ema200"])).astype(int)
+    df["exit_long"] = 0
     df["exit_short"] = (valid & (df["close"] > df["ema200"])).astype(int)
 
     return df
@@ -165,9 +180,10 @@ def compute_exit_signals(dataframe: pd.DataFrame) -> pd.DataFrame:
 
 
 class TrendFollowCore(IStrategy):
-    """Trend-following strategy for BTC/ETH futures: EMA-200 direction
-    filter, ADX-14 trend-strength gate, and a 20-candle Donchian breakout
-    trigger. See the module docstring for full scope and rationale.
+    """SHORT-only trend-following strategy for BTC/ETH futures: EMA-200
+    direction filter, ADX-14 trend-strength gate, and a 20-candle
+    Donchian breakout trigger. See the module docstring for full scope,
+    rationale, and the SHORT-only structural note.
     """
 
     INTERFACE_VERSION = 3

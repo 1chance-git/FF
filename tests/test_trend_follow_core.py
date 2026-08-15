@@ -182,11 +182,14 @@ class TestDonchianExcludesCurrentCandle:
 
 
 class TestEntrySignalConditions:
-    def test_long_fires_on_engineered_breakout(self):
+    def test_long_never_fires_even_on_engineered_breakout(self):
+        """SHORT-only: a setup that would have fired enter_long under the
+        old long/short logic (uptrend + ADX>25 + Donchian upper breakout)
+        must produce enter_long == 0 -- structurally, not via a filter."""
         df = compute_indicators(_trending_ohlcv())
         df = compute_entry_signals(df)
-        assert df["enter_long"].iloc[-1] == 1
-        assert df.loc[df.index[-1], "enter_tag"] == "trend_long_donchian_breakout"
+        assert df["enter_long"].iloc[-1] == 0
+        assert (df["enter_long"] == 0).all()
 
     def test_short_fires_on_engineered_breakdown(self):
         raw = _ramp_pullback_then_breakout(direction=-1)
@@ -195,16 +198,19 @@ class TestEntrySignalConditions:
         assert df["enter_short"].iloc[-1] == 1
         assert df.loc[df.index[-1], "enter_tag"] == "trend_short_donchian_breakout"
 
-    def test_no_long_signal_without_donchian_breakout(self):
-        """Uptrend (close > ema200, adx > 25) but no breakout on the plateau
-        bar just before the engineered final breakout bar."""
+    def test_no_long_signal_even_on_donchian_breakout(self):
+        """Uptrend (close > ema200, adx > 25) with a genuine upper-channel
+        breakout on the final bar -- the exact setup that used to fire
+        enter_long under the long/short version of this strategy. Must
+        stay 0 on every bar, structurally."""
         df = compute_indicators(_ramp_pullback_then_breakout(direction=1))
         df = compute_entry_signals(df)
         pre_breakout = df.iloc[-2]  # plateau bar: no new 20-bar high
         assert pre_breakout["close"] > pre_breakout["ema200"]
         assert pre_breakout["adx"] > ADX_THRESHOLD
         assert df["enter_long"].iloc[-2] == 0
-        assert df["enter_long"].iloc[-1] == 1  # sanity: the next bar does break out
+        assert df["enter_long"].iloc[-1] == 0  # breakout bar: still no long signal
+        assert (df["enter_long"] == 0).all()
 
     def test_no_long_signal_without_adx_above_threshold(self):
         """Flat market: close hovers around ema200-ish and ADX stays low."""
